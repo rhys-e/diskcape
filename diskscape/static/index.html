@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="content-security-policy" content="default-src 'self'; script-src 'self';">
+<title>Diskscape</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="logo"></span>Diskscape</div>
+  <form id="scanForm" class="scanform">
+    <input id="pathInput" aria-label="Folder to scan" spellcheck="false" autocomplete="off" placeholder="Folder to scan, e.g. ~ or /">
+    <button class="btn primary" type="submit">Scan</button>
+  </form>
+  <div id="diskMeter" class="diskmeter" hidden>
+    <div class="dm-bar"><span class="dm-scan"></span><span class="dm-used"></span></div>
+    <div class="dm-label"></div>
+  </div>
+</header>
+
+<main id="startView" class="view start" hidden>
+  <h1>What's taking up space?</h1>
+  <p class="sub">Pick a disk or folder to scan. Everything runs locally.</p>
+  <div id="volumes" class="volumes"></div>
+  <div class="quick">
+    <span>Quick scan:</span>
+    <div id="quickFolders"></div>
+  </div>
+</main>
+
+<main id="scanView" class="view scanning" hidden>
+  <div class="orbit"><div class="orbit-ring"></div><div class="orbit-ring r2"></div><div id="scanBytes" class="orbit-bytes">0 B</div></div>
+  <div class="scan-stats">
+    <div><b id="scanFiles">0</b><span>files</span></div>
+    <div><b id="scanDirs">0</b><span>folders</span></div>
+    <div><b id="scanRate">0</b><span>files / s</span></div>
+    <div><b id="scanTime">0s</b><span>elapsed</span></div>
+  </div>
+  <div id="scanCurrent" class="scan-current"></div>
+  <button id="cancelBtn" class="btn">Cancel</button>
+</main>
+
+<main id="resultView" class="view results" hidden>
+  <div class="toolbar">
+    <button id="upBtn" class="iconbtn" title="Up one level (Esc)" aria-label="Up one level">
+      <svg viewBox="0 0 20 20"><path d="M10 4l-6 6h4v6h4v-6h4z"/></svg>
+    </button>
+    <nav id="crumbs" class="crumbs"></nav>
+    <div class="seg" id="viewSeg">
+      <button data-view="sunburst">Sunburst</button>
+      <button data-view="treemap">Treemap</button>
+    </div>
+    <button id="rescanBtn" class="iconbtn" title="Rescan" aria-label="Rescan">
+      <svg viewBox="0 0 20 20"><path d="M15.5 6.5A6.5 6.5 0 1 0 16.5 11h-2a4.5 4.5 0 1 1-1.3-3.2L11 10h6V4z"/></svg>
+    </button>
+  </div>
+  <div class="split">
+    <section class="viz" id="viz">
+      <canvas id="chart" role="img" aria-label="Disk usage chart; the side panel lists the same items"></canvas>
+      <button id="center" class="center" title="Up one level">
+        <span class="c-name"></span><span class="c-size"></span><span class="c-count"></span>
+      </button>
+      <div id="tip" class="tip" hidden></div>
+    </section>
+    <aside class="panel">
+      <div class="panel-head">
+        <div class="ph-name" id="phName"></div>
+        <div class="ph-meta" id="phMeta"></div>
+      </div>
+      <div class="tabs" id="tabs">
+        <button data-tab="contents">Contents</button>
+        <button data-tab="largest">Largest files</button>
+        <button data-tab="types">File types</button>
+      </div>
+      <div class="list" id="list"></div>
+    </aside>
+  </div>
+  <footer class="status" id="status"></footer>
+</main>
+
+<div id="menu" class="menu" hidden></div>
+
+<dialog id="confirm" class="confirm">
+  <form method="dialog">
+    <div class="cf-icon">
+      <svg viewBox="0 0 20 20"><path d="M7 3h6l1 2h3v2H3V5h3zm-2 5h10l-1 9H6z"/></svg>
+    </div>
+    <h2>Move to Trash?</h2>
+    <p id="cfText"></p>
+    <p class="cf-err" id="cfErr"></p>
+    <div class="cf-actions">
+      <button class="btn" value="cancel">Cancel</button>
+      <button class="btn danger" id="cfGo" value="ok">Move to Trash</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
