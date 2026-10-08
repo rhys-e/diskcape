@@ -21,6 +21,14 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 IS_MAC = sys.platform == "darwin"
+# Inline style attributes are used for chart colours; everything else is same-origin only.
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+# Moves a path to the Trash via Finder (so "Put Back" works) and returns where it landed.
+TRASH_SCRIPT = """on run argv
+    tell application "Finder" to set trashed to delete (POSIX file (item 1 of argv) as alias)
+    return POSIX path of (trashed as alias)
+end run"""
 DEFAULT_IDLE_MINUTES = 15
 
 
@@ -95,6 +103,7 @@ def make_handler(app):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", CSP)
             self.end_headers()
             self.wfile.write(body)
 
@@ -110,8 +119,8 @@ def make_handler(app):
             url = urlparse(self.path)
             if not self._authorised(url.path):
                 return self._send(403, {"error": "Forbidden"})
-            if url.path != "/api/ping":
-                app.touch()
+            if url.path.startswith("/api/") and url.path != "/api/ping":
+                app.touch()  # only token-bearing requests count as activity
             try:
                 result = fn(url)
             except ApiError as e:
@@ -199,16 +208,25 @@ def make_handler(app):
             if action == "/api/reveal":
                 subprocess.Popen(["open", "-R", path])
                 return {"ok": True}
-            if path == s.root_path:
-                raise ApiError(400, "Refusing to trash the scanned folder itself")
-            # Finder's delete moves to the Trash, so "Put Back" works.
-            r = subprocess.run(
-                ["osascript", "-e", "on run argv",
-                 "-e", 'tell application "Finder" to delete (POSIX file (item 1 of argv) as alias)',
-                 "-e", "end run", path],
-                capture_output=True, text=True)
+            # Re-check the live filesystem: no symlinked folders on the way, same kind of item.
+            try:
+                with s.lock:
+                    identity = s.check_target(path)
+            except (KeyError, ValueError) as e:
+                raise ApiError(409, str(e).strip("'\""))
+            r = subprocess.run(["osascript", "-e", TRASH_SCRIPT, path], capture_output=True, text=True)
             if r.returncode != 0:
                 raise ApiError(500, r.stderr.strip() or "Finder could not move the item to the Trash")
+            # Finder only takes a path, so the item could still have been swapped after the
+            # check. Confirm what landed in the Trash is what we checked.
+            try:
+                st = os.lstat(r.stdout.strip().rstrip("/") or "/nonexistent")
+                same = (st.st_dev, st.st_ino) == identity
+            except OSError:
+                same = False
+            if not same:
+                raise ApiError(409, "The item changed while it was being trashed. Check the Trash "
+                                    "(Put Back restores it), then rescan.")
             with s.lock:
                 s.remove(path)
             return {"ok": True}

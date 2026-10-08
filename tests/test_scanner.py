@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -110,6 +111,61 @@ class ScannerTest(unittest.TestCase):
             self.s.find(f"{self.root}/a/b")
         with self.assertRaises(ValueError):
             self.s.remove(self.root)
+
+    def test_trashing_a_hard_link_moves_its_bytes_to_the_survivor(self):
+        blob = alloc(f"{self.root}/big/blob.bin")
+        root_before = self.s.root.size
+        links = (f"{self.root}/big/blob.bin", f"{self.root}/a/hardlink.bin")
+        for path, survivor in (links, links[::-1]):
+            with self.subTest(removed=path):
+                self.s = Scanner(self.root)  # fresh tree; remove() only edits the tree, not the disk
+                self.s.run()
+                self.s.remove(path)
+                d, f = self.s.find(survivor)
+                self.assertEqual(f[1], blob)  # the remaining link now carries the bytes
+                self.assertEqual(self.s.root.size, root_before)  # the data still exists once
+                self.assertEqual(d.files[0], f)  # and the folder's files stay sorted
+
+    def test_trashing_every_hard_link_frees_the_bytes(self):
+        blob = alloc(f"{self.root}/big/blob.bin")
+        root_before = self.s.root.size
+        self.s.remove(f"{self.root}/big")
+        self.s.remove(f"{self.root}/a/hardlink.bin")
+        self.assertEqual(self.s.root.size, root_before - blob - alloc(f"{self.root}/big"))
+        self.assertEqual(self.s._links, {})
+
+    def test_check_target_accepts_unchanged_items(self):
+        st = os.lstat(f"{self.root}/a/b/c/clip.mov")
+        self.assertEqual(self.s.check_target(f"{self.root}/a/b/c/clip.mov"), (st.st_dev, st.st_ino))
+        self.assertTrue(self.s.check_target(f"{self.root}/a/b"))
+
+    def test_check_target_refuses_swapped_parent(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(f"{outside.name}/c/clip.mov", 10)
+        shutil.rmtree(f"{self.root}/a/b")
+        os.symlink(outside.name, f"{self.root}/a/b")  # a/b now points outside the scan root
+        with self.assertRaisesRegex(ValueError, "no longer a real folder"):
+            self.s.check_target(f"{self.root}/a/b/c/clip.mov")
+        self.assertTrue(os.path.exists(f"{outside.name}/c/clip.mov"))
+
+    def test_check_target_refuses_symlinks_changes_and_root(self):
+        with self.assertRaisesRegex(ValueError, "Symbolic links"):
+            self.s.check_target(f"{self.root}/link-to-big")
+        os.remove(f"{self.root}/a/b/c/clip.mov")
+        os.mkdir(f"{self.root}/a/b/c/clip.mov")  # was a file at scan time
+        with self.assertRaisesRegex(ValueError, "changed"):
+            self.s.check_target(f"{self.root}/a/b/c/clip.mov")
+        os.rmdir(f"{self.root}/a/b/c/clip.mov")
+        with self.assertRaisesRegex(ValueError, "no longer exists"):
+            self.s.check_target(f"{self.root}/a/b/c/clip.mov")
+        with self.assertRaises(ValueError):
+            self.s.check_target(self.root)
+        with self.assertRaises(KeyError):
+            self.s.check_target("/etc/hosts")
+
+    def test_largest_files_zero(self):
+        self.assertEqual(self.s.largest_files(self.s.root, n=0), [])
 
 
 class ExtensionTest(unittest.TestCase):

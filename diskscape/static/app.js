@@ -119,6 +119,7 @@ async function showStart() {
 }
 
 async function startScan(path) {
+  listCache = {};
   try {
     await api('/api/scan', { path });
     watchScan();
@@ -148,6 +149,7 @@ async function watchScan() {
 }
 
 async function openResults(st) {
+  listCache = {}; // a new scan, even of the same folder, invalidates cached panel data
   S.scanInfo = st;
   S.root = st.root;
   $('#pathInput').value = tilde(st.root);
@@ -751,7 +753,7 @@ $('#quickFolders').addEventListener('click', (ev) => { const b = ev.target.close
 $('#cancelBtn').addEventListener('click', async () => { await api('/api/cancel', {}); });
 $('#upBtn').addEventListener('click', up);
 $('#center').addEventListener('click', up);
-$('#rescanBtn').addEventListener('click', () => { listCache = {}; startScan(S.root); });
+$('#rescanBtn').addEventListener('click', () => startScan(S.root));
 $('#crumbs').addEventListener('click', (ev) => { const b = ev.target.closest('[data-path]'); if (b && b.dataset.path !== S.cur) navigate(b.dataset.path); });
 $('#viewSeg').addEventListener('click', (ev) => {
   const v = ev.target.closest('[data-view]')?.dataset.view;

@@ -77,7 +77,9 @@ class Scanner:
         self.cancelled = False
         # Guards counters during the scan, and the tree afterwards (reads vs. remove()).
         self.lock = threading.RLock()
-        self._seen_inodes = set()
+        # Hard-linked files: (dev, ino) -> [bytes, [(dir, name), ...]]. The first link
+        # listed carries the bytes; the others are recorded as 0 so nothing counts twice.
+        self._links = {}
         self._q = queue.Queue()
         root_dev = _dev(self.root_path)
         self.devs = {root_dev}
@@ -143,10 +145,12 @@ class Scanner:
                     if st.st_nlink > 1:
                         key = (st.st_dev, st.st_ino)
                         with self.lock:
-                            if key in self._seen_inodes:
+                            rec = self._links.get(key)
+                            if rec:
+                                rec[1].append((node, e.name))
                                 alloc = 0
                             else:
-                                self._seen_inodes.add(key)
+                                self._links[key] = [alloc, [(node, e.name)]]
                     node.files.append((e.name, alloc))
                     nfiles += 1
                     nbytes += alloc
@@ -255,6 +259,8 @@ class Scanner:
             stack.extend((d, os.path.join(p, d.name)) for d in n.dirs)
 
     def largest_files(self, node, n=200):
+        if n <= 0:
+            return []
         heap = []
         for d, p in self._walk(node):
             for name, size in d.files:  # sorted descending, so we can stop early
@@ -285,21 +291,93 @@ class Scanner:
                           key=lambda x: -x["size"])
         return {"exts": ext_list, "cats": cat_list}
 
+    def check_target(self, path):
+        """Re-check, against the live filesystem, a path the user wants to act on.
+
+        Walks down from the scan root one component at a time without following
+        symlinks, so a folder swapped for a symlink since the scan can't redirect the
+        action outside the root. Returns the item's (st_dev, st_ino) so the caller can
+        confirm it acted on the same item. Raises KeyError or ValueError on mismatch.
+        """
+        node, f = self.find(path)
+        path = os.path.normpath(path)
+        if path == self.root_path:
+            raise ValueError("Refusing to act on the scanned folder itself")
+        if os.path.realpath(self.root_path) != self.root_path:
+            raise ValueError("The scanned folder has moved since the scan")
+        parts = os.path.relpath(path, self.root_path).split(os.sep)
+        fd = os.open(self.root_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts[:-1]:
+                try:
+                    nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                except OSError:
+                    raise ValueError(f"{part!r} is no longer a real folder; rescan first")
+                os.close(fd)
+                fd = nfd
+            try:
+                st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            except OSError:
+                raise ValueError("The item no longer exists; rescan first")
+        finally:
+            os.close(fd)
+        if stat.S_ISLNK(st.st_mode):
+            raise ValueError("Symbolic links can't be trashed from Diskscape; use Reveal in Finder")
+        if stat.S_ISDIR(st.st_mode) != (f is None):
+            raise ValueError("The item has changed since the scan; rescan first")
+        return st.st_dev, st.st_ino
+
     def remove(self, path):
-        """Drop a path from the tree (after it has been trashed) and fix up ancestor totals."""
+        """Drop a path from the tree (after it has been trashed) and fix up totals."""
         node, f = self.find(path)
         if f:
             parent, size, count = node, f[1], 1
             node.files.remove(f)
+
+            def gone(d, name):
+                return d is node and name == f[0]
         else:
             if node is self.root:
                 raise ValueError("cannot remove the scan root")
             parent, size, count = node.parent, node.size, node.count + 1
             parent.dirs.remove(node)
-        while parent is not None:
-            parent.size -= size
-            parent.count -= count
-            parent = parent.parent
+
+            def gone(d, name):
+                return self._within(d, node)
+        self._add(parent, -size, -count)
+        self._relink(gone)
+
+    @staticmethod
+    def _within(d, ancestor):
+        while d is not None:
+            if d is ancestor:
+                return True
+            d = d.parent
+        return False
+
+    @staticmethod
+    def _add(d, size, count=0):
+        while d is not None:
+            d.size += size
+            d.count += count
+            d = d.parent
+
+    def _relink(self, gone):
+        """After a removal, hand a hard-linked file's bytes to a surviving link."""
+        for key, rec in list(self._links.items()):
+            size, links = rec
+            keep = [link for link in links if not gone(*link)]
+            if len(keep) == len(links):
+                continue
+            if not keep:
+                del self._links[key]
+                continue
+            carrier_removed = keep[0] is not links[0]
+            rec[1] = keep
+            if carrier_removed and size:
+                d, name = keep[0]
+                d.files = sorted(((n, size if n == name else s) for n, s in d.files), key=lambda x: -x[1])
+                self._add(d, size)
 
 
 def disk_usage(path):

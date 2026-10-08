@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -79,7 +80,34 @@ class ServerTest(unittest.TestCase):
         code, _ = self.request("POST", "/api/trash", {"path": "/etc/hosts"})
         self.assertIn(code, (404, 501))  # 501 on non-macOS
         code, _ = self.request("POST", "/api/trash", {"path": self.root})
-        self.assertIn(code, (400, 501))
+        self.assertIn(code, (409, 501))
+
+    def test_security_headers(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+        conn.request("GET", "/", headers={"Host": f"127.0.0.1:{self.app.port}"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        csp = resp.getheader("Content-Security-Policy", "")
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
+
+    def test_top_zero(self):
+        self.assertEqual(self.request("GET", "/api/top?n=0"), (200, []))
+
+    def test_trash_rechecks_filesystem(self):
+        if sys.platform != "darwin":
+            self.skipTest("trash is macOS-only")
+        # The scan saw a real file; replace it with a symlink before trashing.
+        os.rename(f"{self.root}/sub/file.txt", f"{self.root}/sub/file.bak")
+        os.symlink("/etc/hosts", f"{self.root}/sub/file.txt")
+        try:
+            code, body = self.request("POST", "/api/trash", {"path": f"{self.root}/sub/file.txt"})
+            self.assertEqual(code, 409)
+            self.assertIn("Symbolic links", body["error"])
+        finally:
+            os.remove(f"{self.root}/sub/file.txt")
+            os.rename(f"{self.root}/sub/file.bak", f"{self.root}/sub/file.txt")
 
     def test_scan_rejects_non_folder(self):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
@@ -144,6 +172,19 @@ class IdleTest(unittest.TestCase):
         self.clock.advance(61)  # then it goes idle and stops
         thread.join(5)
         self.assertTrue(stopped.is_set())
+
+    def test_unauthenticated_requests_do_not_count(self):
+        self.serve(watch=False)
+        self.clock.advance(30)
+        for path, token in (("/", None), ("/nope", None), ("/api/status", None), ("/api/status", "bad")):
+            conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+            headers = {"Host": f"127.0.0.1:{self.app.port}"}
+            if token:
+                headers["X-Token"] = token
+            conn.request("GET", path, headers=headers)
+            conn.getresponse().read()
+            conn.close()
+        self.assertEqual(self.app.idle_for(), 30)
 
     def test_passive_ping_does_not_count(self):
         self.serve(watch=False)
