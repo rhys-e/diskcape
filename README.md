@@ -4,7 +4,13 @@
 
 Diskscape scans a disk or folder and shows the result as an interactive sunburst or treemap in your browser. It is one small Python package that uses only the standard library, plus a hand-written canvas UI. You don't need npm, Electron or an App Store download, and nothing leaves your machine.
 
-<!-- TODO: add a screenshot: ![Diskscape sunburst view](docs/screenshot.png) -->
+![Diskscape sunburst view in dark mode](docs/screenshot-dark.png)
+
+<details>
+<summary>Treemap view (light mode)</summary>
+
+![Diskscape treemap view in light mode](docs/screenshot-light.png)
+</details>
 
 ## Features
 
@@ -53,6 +59,7 @@ Options:
 | `PATH`          | Folder to scan straight away (default: show start screen)  |
 | `--port N`      | Port to listen on (default `8765`, or the next free one)   |
 | `--no-browser`  | Print the URL instead of opening a browser                 |
+| `--idle-timeout MIN` | Stop after `MIN` minutes of inactivity (default `15`, `0` = never) |
 | `--version`     | Print the version and exit                                 |
 
 ### Controls
@@ -63,6 +70,10 @@ Options:
 | Go up                        | `Esc`, `Backspace`, the centre circle, or ↑        |
 | Switch view                  | `s` (sunburst) / `t` (treemap)                     |
 | Reveal in Finder / Trash     | Right-click, or hover a row in the list            |
+
+### Idle shutdown
+
+Diskscape stops itself after 15 minutes without activity, so it doesn't sit in the background forever. Activity means using the page (moving the mouse, scrolling, typing). A browser tab you've left open doesn't count. A running scan never times out, and the timer restarts when the scan finishes. If the server has stopped, the page tells you; run the command again to start a new session.
 
 ### Protected folders
 
@@ -97,6 +108,12 @@ There is nothing to install.
 ```sh
 python3 -m unittest -v               # run the tests
 python3 -m diskscape --no-browser .  # run against this repo
+```
+
+To regenerate the README screenshots, run the script below. It uses a synthetic home folder, so no real file names appear, and needs [chrome-headless-shell](https://googlechromelabs.github.io/chrome-for-testing/):
+
+```sh
+python3 scripts/screenshot.py --chrome /path/to/chrome-headless-shell
 ```
 
 The front end is plain JavaScript with no build step. Edit `diskscape/static/*` and reload the page.

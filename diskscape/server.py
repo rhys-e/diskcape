@@ -6,6 +6,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -20,6 +21,7 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css; charset=utf-8"),
 }
 IS_MAC = sys.platform == "darwin"
+DEFAULT_IDLE_MINUTES = 15
 
 
 class ApiError(Exception):
@@ -29,12 +31,25 @@ class ApiError(Exception):
 
 
 class App:
-    """Server state: the current scan plus the per-run access token."""
+    """Server state: the current scan, the per-run access token and the idle clock."""
 
-    def __init__(self, token=None):
+    def __init__(self, token=None, idle_timeout=0):
         self.token = token or secrets.token_urlsafe(16)
         self.port = 0
         self.scanner = None
+        self.idle_timeout = idle_timeout  # seconds; 0 = never stop
+        self.last_active = time.time()
+
+    def touch(self):
+        self.last_active = time.time()
+
+    def idle_for(self):
+        """Seconds since the user last did anything. A running scan is never idle."""
+        s = self.scanner
+        if s and s.state in ("scanning", "finalizing"):
+            return 0.0
+        since = max(self.last_active, (s.finished or 0) if s else 0)
+        return time.time() - since
 
     def scan(self, path):
         if self.scanner:
@@ -94,6 +109,8 @@ def make_handler(app):
             url = urlparse(self.path)
             if not self._authorised(url.path):
                 return self._send(403, {"error": "Forbidden"})
+            if url.path != "/api/ping":
+                app.touch()
             try:
                 result = fn(url)
             except ApiError as e:
@@ -122,6 +139,11 @@ def make_handler(app):
                 return body
             if url.path == "/api/volumes":
                 return volumes()
+            if url.path == "/api/ping":
+                # The page pings periodically; active=1 means the user interacted since the last ping.
+                if qs.get("active") == "1":
+                    app.touch()
+                return {"ok": True, "idle_timeout": app.idle_timeout}
             if url.path not in ("/api/tree", "/api/top", "/api/types"):
                 return None
             s = app.done_scanner()
@@ -214,15 +236,39 @@ def make_server(app, port, attempts=20):
     raise OSError(f"No free port in {port}-{port + attempts - 1}")
 
 
+def stop_when_idle(app, httpd, poll=None):
+    """Shut the server down once app.idle_for() exceeds app.idle_timeout.
+
+    Returns an Event that is set if the shutdown was due to inactivity.
+    """
+    stopped = threading.Event()
+    if not app.idle_timeout:
+        return stopped
+    poll = poll or min(30.0, app.idle_timeout / 10)
+
+    def watch():
+        while app.idle_for() < app.idle_timeout:
+            time.sleep(poll)
+        stopped.set()
+        httpd.shutdown()
+
+    threading.Thread(target=watch, daemon=True).start()
+    return stopped
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="diskscape", description="Zero-dependency disk space analyser.")
     ap.add_argument("path", nargs="?", help="folder to scan straight away (default: show the start screen)")
     ap.add_argument("--port", type=int, default=8765, help="port to listen on (default: 8765, or next free)")
     ap.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    ap.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_MINUTES, metavar="MIN",
+                    help=f"stop after MIN minutes without activity (default: {DEFAULT_IDLE_MINUTES}; 0 = never)")
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
     args = ap.parse_args(argv)
 
-    app = App()
+    if args.idle_timeout < 0:
+        ap.error("--idle-timeout must be 0 or more")
+    app = App(idle_timeout=args.idle_timeout * 60)
     if args.path:
         path = os.path.expanduser(args.path)
         if not os.path.isdir(path):
@@ -234,12 +280,16 @@ def main(argv=None):
         sys.exit(str(e))
 
     url = f"http://127.0.0.1:{app.port}/?t={app.token}"
-    print(f"Diskscape running at {url}\nPress Ctrl+C to stop.", flush=True)
+    idle_note = f" (or idle for {args.idle_timeout:g} min)" if args.idle_timeout else ""
+    print(f"Diskscape running at {url}\nPress Ctrl+C to stop{idle_note}.", flush=True)
     if not args.no_browser:
         threading.Timer(0.3, webbrowser.open, [url]).start()
+    idle_stop = stop_when_idle(app, httpd)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print()
     finally:
         httpd.server_close()
+    if idle_stop.is_set():
+        print(f"Stopped after {args.idle_timeout:g} minutes of inactivity.")

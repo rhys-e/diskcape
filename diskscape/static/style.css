@@ -245,6 +245,19 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .cf-actions { display: flex; gap: 10px; justify-content: center; margin-top: 20px; }
 .cf-actions .btn { flex: 1; }
 
+.stopped {
+  position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; padding: 24px;
+  background: color-mix(in srgb, var(--bg) 70%, transparent); backdrop-filter: blur(6px);
+}
+.stopped-card {
+  max-width: 420px; text-align: center; padding: 28px 30px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
+}
+.stopped-card .logo { display: inline-block; width: 34px; height: 34px; opacity: .5; filter: grayscale(1); }
+.stopped-card h2 { margin: 10px 0 6px; font-size: 17px; }
+.stopped-card p { margin: 0; color: var(--muted); line-height: 1.6; }
+.stopped-card code { font: 12px ui-monospace, "SF Mono", Menlo, monospace; background: var(--bg3); padding: 2px 6px; border-radius: 4px; color: var(--text); }
+
 @media (max-width: 860px) {
   .split { flex-direction: column; }
   .panel { width: auto; height: 45%; border-left: 0; border-top: 1px solid var(--line); }

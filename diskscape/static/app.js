@@ -14,7 +14,7 @@ const S = {
   nodes: [],       // flattened tree
   byPath: new Map(),
   rects: [],       // treemap rects (for hit testing)
-  view: load('view', 'sunburst'),
+  view: new URLSearchParams(location.hash.slice(1)).get('view') || load('view', 'sunburst'),
   tab: 'contents',
   hover: null,
   anim: null,
@@ -27,11 +27,17 @@ function load(k, d) { try { return localStorage.getItem('ds.' + k) || d; } catch
 function save(k, v) { try { localStorage.setItem('ds.' + k, v); } catch {} }
 
 async function api(path, body) {
-  const r = await fetch(path, {
-    method: body ? 'POST' : 'GET',
-    headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
+  let r;
+  try {
+    r = await fetch(path, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    showStopped(); // network error: the server has gone away
+    throw e;
+  }
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -771,6 +777,24 @@ document.addEventListener('keydown', (ev) => {
 });
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', requestDraw);
 
+// ---------- idle heartbeat ----------
+// The server stops after a period of inactivity. Ping it regularly, but only report
+// "active" if the user has actually done something, so a forgotten tab doesn't keep it alive.
+let interacted = false;
+for (const ev of ['pointermove', 'pointerdown', 'keydown', 'wheel']) {
+  addEventListener(ev, () => { interacted = true; }, { passive: true, capture: true });
+}
+setInterval(() => {
+  const active = interacted;
+  interacted = false;
+  api('/api/ping?active=' + (active ? 1 : 0)).catch(() => {});
+}, 30000);
+
+function showStopped() {
+  $('#stopped').hidden = false;
+}
+
 init().catch((e) => {
+  if (!$('#stopped').hidden) return;
   document.body.innerHTML = `<div class="empty" style="margin:auto">Couldn't reach the Diskscape server (${esc(e.message)}).<br>Open the URL printed in the terminal, including its <code>?t=</code> token.</div>`;
 });
