@@ -110,15 +110,7 @@ python3 -m unittest -v               # run the tests
 python3 -m diskscape --no-browser .  # run against this repo
 ```
 
-To regenerate the README screenshots, run the script below. It uses a synthetic home folder, so no real file names appear, and needs [chrome-headless-shell](https://googlechromelabs.github.io/chrome-for-testing/):
-
-```sh
-python3 scripts/screenshot.py --chrome /path/to/chrome-headless-shell
-```
-
 The front end is plain JavaScript with no build step. Edit `diskscape/static/*` and reload the page.
-
-Contributions are welcome. Please keep the zero-dependency spirit: standard library only on the Python side, and no frameworks or CDNs in the UI.
 
 ## License
 
