@@ -180,7 +180,9 @@ class ScannerTest(unittest.TestCase):
     def test_scan_skips_folder_replaced_by_another(self):
         path = f"{self.root}/empty"
         st = os.lstat(path)
-        os.rmdir(path)
+        # Move the original aside rather than deleting it: some filesystems (e.g. ext4)
+        # reuse a freed inode number at once, which would make the new folder identical.
+        os.rename(path, f"{self.root}/elsewhere")
         os.mkdir(path)
         write(f"{path}/new.bin", 10)
         node = Dir("empty", self.s.root)
