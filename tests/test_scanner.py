@@ -85,8 +85,10 @@ class ScannerTest(unittest.TestCase):
 
     def test_largest_files(self):
         top = self.s.largest_files(self.s.root, n=2)
-        self.assertEqual([f["name"] for f in top], ["blob.bin", "clip.mov"])
-        self.assertEqual(top[0]["path"], f"{self.root}/big/blob.bin")
+        # blob.bin and hardlink.bin share an inode; whichever the scan reaches first
+        # carries the size, and that order depends on thread timing and the filesystem.
+        self.assertIn(top[0]["path"], (f"{self.root}/big/blob.bin", f"{self.root}/a/hardlink.bin"))
+        self.assertEqual(top[1]["path"], f"{self.root}/a/b/c/clip.mov")
 
     def test_types(self):
         t = self.s.types(self.s.root)
