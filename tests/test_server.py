@@ -87,64 +87,87 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.request("POST", "/api/scan", ["not", "an", "object"])[0], 400)
 
 
-class IdleTest(unittest.TestCase):
-    def start(self, timeout):
-        app = App(token="t", idle_timeout=timeout)
-        httpd = make_server(app, 0)
-        stopped = stop_when_idle(app, httpd, poll=0.02)
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(httpd.server_close)
-        return app, thread, stopped
+class FakeClock:
+    def __init__(self):
+        self.now = time.time()
 
-    def ping(self, app, active):
-        conn = http.client.HTTPConnection("127.0.0.1", app.port, timeout=5)
-        conn.request("GET", f"/api/ping?active={int(active)}",
-                     headers={"Host": f"127.0.0.1:{app.port}", "X-Token": "t"})
-        self.assertEqual(conn.getresponse().status, 200)
-        conn.close()
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class IdleTest(unittest.TestCase):
+    """Idle shutdown, driven by a fake clock so slow CI machines can't cause races."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.app = App(token="t", idle_timeout=60, clock=self.clock)
+        self.httpd = make_server(self.app, 0)
+        self.addCleanup(self.httpd.server_close)
+
+    def serve(self, watch=True):
+        stopped = stop_when_idle(self.app, self.httpd, poll=0.01) if watch else None
+        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        if not watch:
+            self.addCleanup(self.httpd.shutdown)
+        return thread, stopped
+
+    def ping(self, active):
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+        try:
+            conn.request("GET", f"/api/ping?active={int(active)}",
+                         headers={"Host": f"127.0.0.1:{self.app.port}", "X-Token": "t"})
+            self.assertEqual(conn.getresponse().status, 200)
+        finally:
+            conn.close()
 
     def test_stops_when_idle(self):
-        app, thread, stopped = self.start(0.2)
+        thread, stopped = self.serve()
+        self.clock.advance(59)
+        time.sleep(0.1)  # several watcher polls
+        self.assertTrue(thread.is_alive())
+        self.clock.advance(2)
         thread.join(5)
         self.assertFalse(thread.is_alive())
         self.assertTrue(stopped.is_set())
 
     def test_activity_keeps_it_alive(self):
-        app, thread, stopped = self.start(0.4)
-        for _ in range(6):  # 0.6s of activity, longer than the timeout
-            self.ping(app, active=True)
-            time.sleep(0.1)
+        thread, stopped = self.serve()
+        for _ in range(5):  # 200s of activity in total, well past the 60s timeout
+            self.clock.advance(40)
+            self.ping(active=True)
+        time.sleep(0.1)
         self.assertTrue(thread.is_alive())
-        thread.join(5)  # then it goes idle and stops
+        self.clock.advance(61)  # then it goes idle and stops
+        thread.join(5)
         self.assertTrue(stopped.is_set())
 
     def test_passive_ping_does_not_count(self):
-        app = App(token="t", idle_timeout=60)
-        httpd = make_server(app, 0)
-        self.addCleanup(httpd.server_close)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        self.addCleanup(httpd.shutdown)
-        app.last_active -= 30
-        self.ping(app, active=False)
-        self.assertGreaterEqual(app.idle_for(), 30)
-        self.ping(app, active=True)
-        self.assertLess(app.idle_for(), 1)
+        self.serve(watch=False)
+        self.clock.advance(30)
+        self.ping(active=False)
+        self.assertEqual(self.app.idle_for(), 30)
+        self.ping(active=True)
+        self.assertEqual(self.app.idle_for(), 0)
 
     def test_running_scan_is_never_idle(self):
-        app = App(idle_timeout=1)
-        app.last_active -= 100
+        self.clock.advance(100)
 
         class FakeScan:
             state, finished = "scanning", None
-        app.scanner = FakeScan()
-        self.assertEqual(app.idle_for(), 0)
-        FakeScan.state, FakeScan.finished = "done", time.time()
-        self.assertLess(app.idle_for(), 1)  # clock restarts when the scan finishes
+        self.app.scanner = FakeScan()
+        self.assertEqual(self.app.idle_for(), 0)
+        FakeScan.state, FakeScan.finished = "done", self.clock()
+        self.assertEqual(self.app.idle_for(), 0)  # clock restarts when the scan finishes
+        self.clock.advance(5)
+        self.assertEqual(self.app.idle_for(), 5)
 
     def test_disabled(self):
-        app = App(idle_timeout=0)
-        self.assertFalse(stop_when_idle(app, None).is_set())
+        self.app.idle_timeout = 0
+        self.assertFalse(stop_when_idle(self.app, self.httpd).is_set())
 
 
 if __name__ == "__main__":

@@ -33,15 +33,16 @@ class ApiError(Exception):
 class App:
     """Server state: the current scan, the per-run access token and the idle clock."""
 
-    def __init__(self, token=None, idle_timeout=0):
+    def __init__(self, token=None, idle_timeout=0, clock=time.time):
         self.token = token or secrets.token_urlsafe(16)
         self.port = 0
         self.scanner = None
         self.idle_timeout = idle_timeout  # seconds; 0 = never stop
-        self.last_active = time.time()
+        self.clock = clock  # injectable so tests don't depend on real time
+        self.last_active = clock()
 
     def touch(self):
-        self.last_active = time.time()
+        self.last_active = self.clock()
 
     def idle_for(self):
         """Seconds since the user last did anything. A running scan is never idle."""
@@ -49,7 +50,7 @@ class App:
         if s and s.state in ("scanning", "finalizing"):
             return 0.0
         since = max(self.last_active, (s.finished or 0) if s else 0)
-        return time.time() - since
+        return self.clock() - since
 
     def scan(self, path):
         if self.scanner:
