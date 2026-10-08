@@ -32,6 +32,15 @@ end run"""
 DEFAULT_IDLE_MINUTES = 15
 
 
+def osascript_path(stdout):
+    """The POSIX path osascript printed. Only the line ending and a folder's trailing
+    slash are trimmed: file names may legitimately start or end with spaces."""
+    path = stdout[:-1] if stdout.endswith("\n") else stdout
+    if len(path) > 1 and path.endswith("/"):
+        path = path[:-1]
+    return path or "/nonexistent"
+
+
 class ApiError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -205,22 +214,22 @@ def make_handler(app):
                     s.find(path)  # only ever act on paths inside the scanned tree
                 except KeyError:
                     raise ApiError(404, "Path is not in the scan")
-            if action == "/api/reveal":
-                subprocess.Popen(["open", "-R", path])
-                return {"ok": True}
             # Re-check the live filesystem: no symlinked folders on the way, same kind of item.
             try:
                 with s.lock:
-                    identity = s.check_target(path)
+                    identity = s.check_target(path, allow_symlink=action == "/api/reveal")
             except (KeyError, ValueError) as e:
                 raise ApiError(409, str(e).strip("'\""))
+            if action == "/api/reveal":
+                subprocess.Popen(["open", "-R", path])
+                return {"ok": True}
             r = subprocess.run(["osascript", "-e", TRASH_SCRIPT, path], capture_output=True, text=True)
             if r.returncode != 0:
                 raise ApiError(500, r.stderr.strip() or "Finder could not move the item to the Trash")
             # Finder only takes a path, so the item could still have been swapped after the
             # check. Confirm what landed in the Trash is what we checked.
             try:
-                st = os.lstat(r.stdout.strip().rstrip("/") or "/nonexistent")
+                st = os.lstat(osascript_path(r.stdout))
                 same = (st.st_dev, st.st_ino) == identity
             except OSError:
                 same = False

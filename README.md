@@ -87,7 +87,11 @@ Diskscape runs a small HTTP server so the browser can talk to the scanner. It is
 - Every API request needs a random token that is created at startup and passed in the URL, so other websites in your browser can't call it.
 - It checks the `Host` header, which blocks DNS-rebinding attacks.
 - *Reveal* and *Trash* only accept paths inside the folder you scanned, and never the scanned folder itself.
-- Trash always asks for confirmation and goes through Finder, so it can be undone.
+- Before acting, Diskscape re-checks the path on disk, walking down from the scanned folder without following symlinks. It refuses if a folder on the way has been swapped for a symlink, if the item has changed type, or if the item is itself a symlink.
+- The scanner opens each folder by handle and checks it is the same folder it saw listed, so a folder swapped for a symlink mid-scan can't lead it outside the folder you chose.
+- Trash always asks for confirmation and goes through Finder, so *Put Back* works.
+
+**Known limitation:** Finder can only be given a path, not a handle. Someone able to modify the scanned folder at the exact moment you trash something could swap an item between Diskscape's check and Finder's move. Diskscape then confirms the item that landed in the Trash is the one it checked. If it isn't, it reports this instead of updating the view. The wrong item would be in the Trash, where *Put Back* restores it, not deleted. Closing this gap fully would mean moving items without Finder, which loses *Put Back*.
 
 ## How it works
 

@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import unittest
 
-from diskscape.scanner import Scanner, extension
+from diskscape.scanner import Dir, Scanner, extension
 
 
 def write(path, nbytes):
@@ -163,6 +163,33 @@ class ScannerTest(unittest.TestCase):
             self.s.check_target(self.root)
         with self.assertRaises(KeyError):
             self.s.check_target("/etc/hosts")
+
+    def test_scan_skips_folder_swapped_for_symlink(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(f"{outside.name}/secret.bin", 100_000)
+        path = f"{self.root}/empty"
+        st = os.lstat(path)  # what the parent's listing saw
+        os.rmdir(path)
+        os.symlink(outside.name, path)  # swapped before the worker opens it
+        node = Dir("empty", self.s.root)
+        self.s._scan_dir(node, path, (st.st_dev, st.st_ino))
+        self.assertTrue(node.err)
+        self.assertEqual(node.files, [])
+
+    def test_scan_skips_folder_replaced_by_another(self):
+        path = f"{self.root}/empty"
+        st = os.lstat(path)
+        os.rmdir(path)
+        os.mkdir(path)
+        write(f"{path}/new.bin", 10)
+        node = Dir("empty", self.s.root)
+        self.s._scan_dir(node, path, (st.st_dev, st.st_ino))
+        self.assertTrue(node.err)
+
+    def test_check_target_for_reveal_allows_symlinks(self):
+        st = os.lstat(f"{self.root}/link-to-big")
+        self.assertEqual(self.s.check_target(f"{self.root}/link-to-big", allow_symlink=True), (st.st_dev, st.st_ino))
 
     def test_largest_files_zero(self):
         self.assertEqual(self.s.largest_files(self.s.root, n=0), [])

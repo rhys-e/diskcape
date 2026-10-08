@@ -7,7 +7,7 @@ import threading
 import time
 import unittest
 
-from diskscape.server import App, make_server, stop_when_idle
+from diskscape.server import App, make_server, osascript_path, stop_when_idle
 
 
 class ServerTest(unittest.TestCase):
@@ -113,6 +113,15 @@ class ServerTest(unittest.TestCase):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
         self.assertEqual(code, 400)
         self.assertEqual(self.request("POST", "/api/scan", ["not", "an", "object"])[0], 400)
+
+
+class OsascriptPathTest(unittest.TestCase):
+    def test_keeps_meaningful_whitespace(self):
+        self.assertEqual(osascript_path("/Users/x/.Trash/name ends in space \n"), "/Users/x/.Trash/name ends in space ")
+        self.assertEqual(osascript_path("/Users/x/.Trash/ leading\n"), "/Users/x/.Trash/ leading")
+        self.assertEqual(osascript_path("/Users/x/.Trash/folder /\n"), "/Users/x/.Trash/folder ")
+        self.assertEqual(osascript_path("/\n"), "/")
+        self.assertEqual(osascript_path(""), "/nonexistent")
 
 
 class FakeClock:

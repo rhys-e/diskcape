@@ -94,7 +94,12 @@ class Scanner:
 
     def run(self):
         """Scan synchronously. Use start() to scan in the background."""
-        self._q.put((self.root, self.root_path))
+        try:
+            st = os.lstat(self.root_path)
+            self._q.put((self.root, self.root_path, (st.st_dev, st.st_ino)))
+        except OSError:
+            self.root.err = True
+            self.errors += 1
         threads = [threading.Thread(target=self._worker, daemon=True) for _ in range(self.workers)]
         for t in threads:
             t.start()
@@ -123,10 +128,18 @@ class Scanner:
             finally:
                 self._q.task_done()
 
-    def _scan_dir(self, node, path):
+    def _scan_dir(self, node, path, identity):
         nfiles = nbytes = errs = 0
+        fd = None
         try:
-            with os.scandir(path) as it:
+            # Open by handle and confirm it is the very folder seen when it was queued.
+            # If it (or a folder above it) was swapped for a symlink since, the identity
+            # won't match and we skip it rather than wander outside the scan root.
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) != identity:
+                raise OSError(f"{path} changed during the scan")
+            with os.scandir(fd) as it:
                 for e in it:
                     try:
                         st = e.stat(follow_symlinks=False)
@@ -135,12 +148,13 @@ class Scanner:
                         continue
                     alloc = st.st_blocks * 512
                     if stat.S_ISDIR(st.st_mode):
-                        if st.st_dev not in self.devs or e.path in SKIP_PATHS:
+                        child_path = os.path.join(path, e.name)
+                        if st.st_dev not in self.devs or child_path in SKIP_PATHS:
                             continue
                         child = Dir(e.name, node)
                         child.size = alloc
                         node.dirs.append(child)
-                        self._q.put((child, e.path))
+                        self._q.put((child, child_path, (st.st_dev, st.st_ino)))
                         continue
                     if st.st_nlink > 1:
                         key = (st.st_dev, st.st_ino)
@@ -157,6 +171,9 @@ class Scanner:
         except OSError:
             node.err = True
             errs += 1
+        finally:
+            if fd is not None:
+                os.close(fd)
         with self.lock:
             self.files += nfiles
             self.dirs += 1
@@ -291,7 +308,7 @@ class Scanner:
                           key=lambda x: -x["size"])
         return {"exts": ext_list, "cats": cat_list}
 
-    def check_target(self, path):
+    def check_target(self, path, allow_symlink=False):
         """Re-check, against the live filesystem, a path the user wants to act on.
 
         Walks down from the scan root one component at a time without following
@@ -322,6 +339,8 @@ class Scanner:
         finally:
             os.close(fd)
         if stat.S_ISLNK(st.st_mode):
+            if allow_symlink:
+                return st.st_dev, st.st_ino
             raise ValueError("Symbolic links can't be trashed from Diskscape; use Reveal in Finder")
         if stat.S_ISDIR(st.st_mode) != (f is None):
             raise ValueError("The item has changed since the scan; rescan first")
