@@ -7,7 +7,9 @@ import threading
 import time
 import unittest
 
-from diskscape.server import App, make_server, osascript_path, stop_when_idle
+import socket
+
+from diskscape.server import CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, stop_when_done
 
 
 class ServerTest(unittest.TestCase):
@@ -145,12 +147,15 @@ class IdleTest(unittest.TestCase):
         self.addCleanup(self.httpd.server_close)
 
     def serve(self, watch=True):
-        stopped = stop_when_idle(self.app, self.httpd, poll=0.01) if watch else None
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         thread.start()
-        if not watch:
+        if watch:
+            stop_when_done(self.app, self.httpd, poll=0.01)
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(self.app.request_stop, "test over")
+        else:
             self.addCleanup(self.httpd.shutdown)
-        return thread, stopped
+        return thread
 
     def ping(self, active):
         conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
@@ -162,17 +167,17 @@ class IdleTest(unittest.TestCase):
             conn.close()
 
     def test_stops_when_idle(self):
-        thread, stopped = self.serve()
+        thread = self.serve()
         self.clock.advance(59)
         time.sleep(0.1)  # several watcher polls
         self.assertTrue(thread.is_alive())
         self.clock.advance(2)
         thread.join(5)
         self.assertFalse(thread.is_alive())
-        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.app.stop_reason, "idle")
 
     def test_activity_keeps_it_alive(self):
-        thread, stopped = self.serve()
+        thread = self.serve()
         for _ in range(5):  # 200s of activity in total, well past the 60s timeout
             self.clock.advance(40)
             self.ping(active=True)
@@ -180,7 +185,7 @@ class IdleTest(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.clock.advance(61)  # then it goes idle and stops
         thread.join(5)
-        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.app.stop_reason, "idle")
 
     def test_unauthenticated_requests_do_not_count(self):
         self.serve(watch=False)
@@ -217,7 +222,92 @@ class IdleTest(unittest.TestCase):
 
     def test_disabled(self):
         self.app.idle_timeout = 0
-        self.assertFalse(stop_when_idle(self.app, self.httpd).is_set())
+        thread = self.serve()
+        self.clock.advance(10 ** 6)
+        time.sleep(0.1)
+        self.assertTrue(thread.is_alive())
+        self.assertIsNone(self.app.stop_reason)
+
+
+class WindowTest(unittest.TestCase):
+    """The app window: launch-code exchange, and stopping when the window closes."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.app = App(token="t", clock=self.clock)
+        self.app.track_window = True
+        self.httpd = make_server(self.app, 0)
+        self.addCleanup(self.httpd.server_close)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        stop_when_done(self.app, self.httpd, poll=0.01)
+        self.addCleanup(self.thread.join, 5)
+        self.addCleanup(self.app.request_stop, "test over")
+
+    def post(self, path, body, headers=()):
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+        try:
+            conn.request("POST", path, json.dumps(body), {"Host": f"127.0.0.1:{self.app.port}", **dict(headers)})
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read())
+        finally:
+            conn.close()
+
+    def open_window(self):
+        """Open the event stream the way the page does; returns the socket."""
+        sock = socket.create_connection(("127.0.0.1", self.app.port), timeout=5)
+        sock.sendall(f"GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{self.app.port}\r\nX-Token: t\r\n\r\n".encode())
+        self.assertIn(b"200", sock.recv(1024).split(b"\r\n")[0])
+        return sock
+
+    def wait_for(self, condition):
+        deadline = time.time() + 5
+        while not condition() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(condition())
+
+    def test_launch_code_works_once(self):
+        code = self.app.new_launch_code()
+        self.assertEqual(self.post("/api/claim", {"code": code}), (200, {"token": "t"}))
+        self.assertEqual(self.post("/api/claim", {"code": code})[0], 403)
+        self.assertEqual(self.post("/api/claim", {"code": "guess"})[0], 403)
+        code = self.app.new_launch_code()
+        self.assertEqual(self.post("/api/claim", {"code": code}, {"Host": "evil.example"})[0], 403)
+
+    def test_events_require_token(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+        conn.request("GET", "/api/events", headers={"Host": f"127.0.0.1:{self.app.port}"})
+        self.assertEqual(conn.getresponse().status, 403)
+        conn.close()
+        self.assertEqual(self.app.windows, 0)
+
+    def test_stops_when_window_closes(self):
+        sock = self.open_window()
+        self.wait_for(lambda: self.app.windows == 1)
+        self.clock.advance(3600)  # an open window keeps it running
+        time.sleep(0.1)
+        self.assertIsNone(self.app.stop_reason)
+        sock.close()
+        self.wait_for(lambda: self.app.windows == 0)
+        self.clock.advance(CLOSE_GRACE + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "window closed")
+
+    def test_reload_within_grace_keeps_running(self):
+        self.open_window().close()
+        self.wait_for(lambda: self.app.window_gone_at is not None)
+        self.clock.advance(CLOSE_GRACE / 2)
+        sock = self.open_window()  # the reloaded page reconnects
+        self.addCleanup(sock.close)
+        self.wait_for(lambda: self.app.windows == 1)
+        self.clock.advance(CLOSE_GRACE * 10)
+        time.sleep(0.1)
+        self.assertIsNone(self.app.stop_reason)
+
+    def test_stops_if_window_never_connects(self):
+        self.clock.advance(CONNECT_TIMEOUT + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "no window")
 
 
 if __name__ == "__main__":

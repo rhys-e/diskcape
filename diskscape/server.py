@@ -3,16 +3,17 @@ import argparse
 import json
 import os
 import secrets
+import select
 import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .scanner import Scanner, disk_usage, volumes
+from .window import AppWindow, NoBrowserError
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_FILES = {
@@ -30,6 +31,9 @@ TRASH_SCRIPT = """on run argv
     return POSIX path of (trashed as alias)
 end run"""
 DEFAULT_IDLE_MINUTES = 15
+CLOSE_GRACE = 3.0  # seconds a window may be disconnected (e.g. reloading) before we stop
+CONNECT_TIMEOUT = 60.0  # seconds for a freshly launched window to connect
+HEARTBEAT = 2.0  # seconds between keep-alive comments on the window's event stream
 
 
 def osascript_path(stdout):
@@ -48,7 +52,7 @@ class ApiError(Exception):
 
 
 class App:
-    """Server state: the current scan, the per-run access token and the idle clock."""
+    """Server state: the scan, the access token, and what decides when to stop."""
 
     def __init__(self, token=None, idle_timeout=0, clock=time.time):
         self.token = token or secrets.token_urlsafe(16)
@@ -56,10 +60,65 @@ class App:
         self.scanner = None
         self.idle_timeout = idle_timeout  # seconds; 0 = never stop
         self.clock = clock  # injectable so tests don't depend on real time
-        self.last_active = clock()
+        self.started = self.last_active = clock()
+        self.track_window = False  # stop when the app window closes
+        self.windows = 0  # open event streams, i.e. open windows
+        self.window_seen = False
+        self.window_gone_at = None
+        self.launch_codes = set()
+        self.stop_reason = None
+        self.stopping = threading.Event()
+        self._lock = threading.Lock()
 
     def touch(self):
         self.last_active = self.clock()
+
+    def new_launch_code(self):
+        """A single-use code to put in the window's URL instead of the token.
+
+        Browser command lines are visible to other users via `ps`; by the time anyone
+        reads this code from there, the window has already exchanged it.
+        """
+        code = secrets.token_urlsafe(16)
+        self.launch_codes.add(code)
+        return code
+
+    def claim(self, code):
+        with self._lock:
+            for known in self.launch_codes:
+                if secrets.compare_digest(known, code):
+                    self.launch_codes.discard(known)
+                    return self.token
+        return None
+
+    def window_opened(self):
+        with self._lock:
+            self.windows += 1
+            self.window_seen = True
+            self.window_gone_at = None
+
+    def window_closed(self):
+        with self._lock:
+            self.windows -= 1
+            if not self.windows:
+                self.window_gone_at = self.clock()
+
+    def request_stop(self, reason):
+        self.stop_reason = self.stop_reason or reason
+
+    def why_stop(self):
+        """Why the server should stop now, or None to keep running."""
+        if self.stop_reason:
+            return self.stop_reason
+        if self.idle_timeout and self.idle_for() >= self.idle_timeout:
+            return "idle"
+        if self.track_window:
+            now = self.clock()
+            if not self.window_seen and now - self.started >= CONNECT_TIMEOUT:
+                return "no window"
+            if self.window_gone_at is not None and now - self.window_gone_at >= CLOSE_GRACE:
+                return "window closed"
+        return None
 
     def idle_for(self):
         """Seconds since the user last did anything. A running scan is never idle."""
@@ -103,24 +162,28 @@ def make_handler(app):
         def log_message(self, *args):
             pass
 
-        def _send(self, code, body, ctype="application/json"):
-            if not isinstance(body, bytes):
-                body = json.dumps(body, separators=(",", ":")).encode()
+        def _headers(self, code, ctype, length=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+            if length is not None:
+                self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy", CSP)
             self.end_headers()
+
+        def _send(self, code, body, ctype="application/json"):
+            if not isinstance(body, bytes):
+                body = json.dumps(body, separators=(",", ":")).encode()
+            self._headers(code, ctype, len(body))
             self.wfile.write(body)
 
         def _authorised(self, path):
             # Host check defeats DNS rebinding; the token defeats cross-site requests.
             if self.headers.get("Host", "") not in (f"127.0.0.1:{app.port}", f"localhost:{app.port}"):
                 return False
-            if path.startswith("/api/"):
+            if path.startswith("/api/") and path != "/api/claim":  # claim checks its own code
                 return secrets.compare_digest(self.headers.get("X-Token", ""), app.token)
             return True
 
@@ -128,7 +191,9 @@ def make_handler(app):
             url = urlparse(self.path)
             if not self._authorised(url.path):
                 return self._send(403, {"error": "Forbidden"})
-            if url.path.startswith("/api/") and url.path != "/api/ping":
+            if url.path == "/api/events" and self.command == "GET":
+                return self._events()
+            if url.path.startswith("/api/") and url.path not in ("/api/ping", "/api/claim"):
                 app.touch()  # only token-bearing requests count as activity
             try:
                 result = fn(url)
@@ -139,6 +204,26 @@ def make_handler(app):
             if isinstance(result, tuple):  # (code, raw bytes, content type) for static files
                 return self._send(*result)
             self._send(200, result)
+
+        def _events(self):
+            """Held open by the app window for as long as it is open.
+
+            The page never sends anything after its request, so the socket becoming
+            readable means the window closed (or reloaded) and the connection ended.
+            """
+            self._headers(200, "text/event-stream")
+            app.window_opened()
+            try:
+                while not app.stopping.is_set():
+                    readable, _, _ = select.select([self.connection], [], [], HEARTBEAT)
+                    if readable:
+                        break
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+            finally:
+                app.window_closed()
 
         def do_GET(self):
             self._dispatch(self._get)
@@ -191,6 +276,11 @@ def make_handler(app):
                     raise ValueError
             except ValueError:
                 raise ApiError(400, "Bad JSON body")
+            if url.path == "/api/claim":
+                token = app.claim(str(data.get("code", "")))
+                if not token:
+                    raise ApiError(403, "This launch link has already been used. Run diskscape again.")
+                return {"token": token}
             if url.path == "/api/scan":
                 path = os.path.realpath(os.path.expanduser(str(data.get("path") or "~")))
                 if not os.path.isdir(path):
@@ -264,31 +354,31 @@ def make_server(app, port, attempts=20):
     raise OSError(f"No free port in {port}-{port + attempts - 1}")
 
 
-def stop_when_idle(app, httpd, poll=None):
-    """Shut the server down once app.idle_for() exceeds app.idle_timeout.
-
-    Returns an Event that is set if the shutdown was due to inactivity.
-    """
-    stopped = threading.Event()
-    if not app.idle_timeout:
-        return stopped
-    poll = poll or min(30.0, app.idle_timeout / 10)
-
+def stop_when_done(app, httpd, poll=0.5):
+    """Shut the server down once app.why_stop() gives a reason, recorded in app.stop_reason."""
     def watch():
-        while app.idle_for() < app.idle_timeout:
+        while not app.why_stop():
             time.sleep(poll)
-        stopped.set()
+        app.request_stop(app.why_stop())
+        app.stopping.set()  # ends open event streams
         httpd.shutdown()
 
     threading.Thread(target=watch, daemon=True).start()
-    return stopped
+
+
+STOP_MESSAGES = {
+    "window closed": "Window closed; Diskscape stopped.",
+    "no window": "The Diskscape window never connected; stopped.",
+    "interrupted": "Stopped.",
+}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="diskscape", description="Zero-dependency disk space analyser.")
     ap.add_argument("path", nargs="?", help="folder to scan straight away (default: show the start screen)")
     ap.add_argument("--port", type=int, default=8765, help="port to listen on (default: 8765, or next free)")
-    ap.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="don't open a window; print a URL to open yourself (for debugging)")
     ap.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_MINUTES, metavar="MIN",
                     help=f"stop after MIN minutes without activity (default: {DEFAULT_IDLE_MINUTES}; 0 = never)")
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
@@ -307,17 +397,30 @@ def main(argv=None):
     except OSError as e:
         sys.exit(str(e))
 
-    url = f"http://127.0.0.1:{app.port}/?t={app.token}"
-    idle_note = f" (or idle for {args.idle_timeout:g} min)" if args.idle_timeout else ""
-    print(f"Diskscape running at {url}\nPress Ctrl+C to stop{idle_note}.", flush=True)
-    if not args.no_browser:
-        threading.Timer(0.3, webbrowser.open, [url]).start()
-    idle_stop = stop_when_idle(app, httpd)
+    window = None
+    if args.no_browser:
+        print(f"Diskscape running at http://127.0.0.1:{app.port}/?t={app.token}", flush=True)
+    else:
+        try:
+            window = AppWindow(f"http://127.0.0.1:{app.port}/?launch={app.new_launch_code()}")
+        except NoBrowserError as e:
+            httpd.server_close()
+            sys.exit(f"diskscape: {e}")
+        app.track_window = True
+        print("Diskscape is open in its own window. Close it, or press Ctrl+C here, to stop.", flush=True)
+
+    stop_when_done(app, httpd)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print()
+        app.request_stop("interrupted")
     finally:
+        app.stopping.set()
         httpd.server_close()
-    if idle_stop.is_set():
+        if window:
+            window.close()
+    if app.stop_reason == "idle":
         print(f"Stopped after {args.idle_timeout:g} minutes of inactivity.")
+    else:
+        print(STOP_MESSAGES.get(app.stop_reason, "Stopped."))

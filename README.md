@@ -2,7 +2,7 @@
 
 **Find out what's filling your Mac's disk, with no dependencies.**
 
-Diskscape scans a disk or folder and shows the result as an interactive sunburst or treemap in your browser. It is one small Python package that uses only the standard library, plus a hand-written canvas UI. You don't need npm, Electron or an App Store download, and nothing leaves your machine.
+Diskscape scans a disk or folder and shows the result as an interactive sunburst or treemap in its own browser window. It is one small Python package that uses only the standard library, plus a hand-written canvas UI. You don't need npm, Electron or an App Store download, and nothing leaves your machine.
 
 ![Diskscape sunburst view in dark mode](docs/screenshot-dark.png)
 
@@ -30,7 +30,7 @@ Diskscape scans a disk or folder and shows the result as an interactive sunburst
 ## Requirements
 
 - macOS with Python 3.9 or later. The `python3` that comes with the Xcode Command Line Tools is enough.
-- Any modern browser.
+- Google Chrome, Chromium, Microsoft Edge or Brave. Diskscape opens in its own window of one of these, using a private, temporary profile (see [Security](#security)).
 
 Scanning and browsing also work on Linux. *Reveal* and *Trash* are macOS-only.
 
@@ -58,7 +58,7 @@ Options:
 | --------------- | ---------------------------------------------------------- |
 | `PATH`          | Folder to scan straight away (default: show start screen)  |
 | `--port N`      | Port to listen on (default `8765`, or the next free one)   |
-| `--no-browser`  | Print the URL instead of opening a browser                 |
+| `--no-browser`  | Don't open a window; print a URL to open yourself (for debugging) |
 | `--idle-timeout MIN` | Stop after `MIN` minutes of inactivity (default `15`, `0` = never) |
 | `--version`     | Print the version and exit                                 |
 
@@ -71,9 +71,11 @@ Options:
 | Switch view                  | `s` (sunburst) / `t` (treemap)                     |
 | Reveal in Finder / Trash     | Right-click, or hover a row in the list            |
 
-### Idle shutdown
+### Stopping
 
-Diskscape stops itself after 15 minutes without activity, so it doesn't sit in the background forever. Activity means using the page (moving the mouse, scrolling, typing). A browser tab you've left open doesn't count. A running scan never times out, and the timer restarts when the scan finishes. If the server has stopped, the page tells you; run the command again to start a new session.
+Close the Diskscape window, or press Ctrl+C in the terminal. Either way, Diskscape quits its browser window and deletes the temporary profile.
+
+It also stops itself after 15 minutes without activity, so it doesn't sit in the background forever. Activity means using the window (moving the mouse, scrolling, typing); a window you've left open doesn't count. A running scan never times out, and the timer restarts when the scan finishes.
 
 ### Protected folders
 
@@ -84,7 +86,8 @@ macOS hides some folders (Mail, Messages, Safari, other apps' containers) from a
 Diskscape runs a small HTTP server so the browser can talk to the scanner. It is locked down:
 
 - It listens on `127.0.0.1` only, never on your network.
-- Every API request needs a random token that is created at startup and passed in the URL, so other websites in your browser can't call it.
+- It opens in its own browser instance with a fresh, temporary profile: no extensions, and no history, cookies or storage shared with your normal browsing. The profile is deleted when Diskscape stops.
+- Every API request needs a random token created at startup, so other websites can't call it. The window's command line, which other users on the Mac can see, carries only a single-use launch code. The page exchanges it for the token as it opens, so the code is already spent by the time anyone could copy it.
 - It checks the `Host` header, which blocks DNS-rebinding attacks.
 - *Reveal* and *Trash* only accept paths inside the folder you scanned, and never the scanned folder itself.
 - Before acting, Diskscape re-checks the path on disk, walking down from the scanned folder without following symlinks. It refuses if a folder on the way has been swapped for a symlink, if the item has changed type, or if the item is itself a symlink.
@@ -99,9 +102,12 @@ Diskscape runs a small HTTP server so the browser can talk to the scanner. It is
 diskscape/
   scanner.py     threaded os.scandir walk -> compact in-memory tree, queries
   server.py      http.server JSON API + static files, CLI entry point
+  window.py      opens the app window on a temporary profile, cleans it up
   static/        index.html, style.css, app.js (canvas sunburst + treemap)
-tests/           unittest suites for the scanner and the HTTP API
+tests/           unittest suites for the scanner, the HTTP API and the window
 ```
+
+The window holds one streaming request open to the server for as long as it is open. When that connection drops and doesn't come back within a few seconds (a reload reconnects), Diskscape knows the window has closed. It then stops, finds its browser instance by the unique profile path, quits it and deletes the profile.
 
 The scanner keeps one small object per folder and a `(name, bytes)` tuple per file. After the walk, it adds up sizes in a single bottom-up pass. The UI then asks for just the part of the tree it is showing: about six levels deep, with anything under 0.1% folded into "N smaller items". This keeps responses small even for millions of files.
 

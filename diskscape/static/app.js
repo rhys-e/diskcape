@@ -1,7 +1,7 @@
 'use strict';
 // Diskscape front end — no dependencies, everything is drawn on a <canvas>.
 
-const TOKEN = new URLSearchParams(location.search).get('t') || '';
+let TOKEN = new URLSearchParams(location.search).get('t') || '';
 const $ = (s) => document.querySelector(s);
 const MAX_RINGS = 6;
 const TAU = Math.PI * 2;
@@ -796,7 +796,38 @@ function showStopped() {
   $('#stopped').hidden = false;
 }
 
-init().catch((e) => {
-  if (!$('#stopped').hidden) return;
-  document.body.innerHTML = `<div class="empty" style="margin:auto">Couldn't reach the Diskscape server (${esc(e.message)}).<br>Open the URL printed in the terminal, including its <code>?t=</code> token.</div>`;
-});
+// ---------- session ----------
+// The window is opened with a single-use launch code rather than the token, because
+// browser command lines are visible to other users. Swap it for the token, then keep
+// the token in the URL so reloading works.
+async function claimToken() {
+  const code = new URLSearchParams(location.search).get('launch');
+  if (TOKEN || !code) return;
+  const r = await fetch('/api/claim', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || 'Could not start a session');
+  TOKEN = j.token;
+  history.replaceState(null, '', '/?t=' + encodeURIComponent(TOKEN) + location.hash);
+}
+
+// The server treats this open request as "the window is open". When the window
+// closes, the connection drops and Diskscape shuts itself down.
+async function holdConnection() {
+  try {
+    const r = await fetch('/api/events', { headers: { 'X-Token': TOKEN } });
+    const reader = r.body.getReader();
+    while (!(await reader.read()).done) { /* keep-alive comments */ }
+  } catch { /* server gone */ }
+  showStopped();
+}
+
+claimToken()
+  .then(() => { holdConnection(); return init(); })
+  .catch((e) => {
+    if (!$('#stopped').hidden) return;
+    document.body.innerHTML = `<div class="empty" style="margin:auto">Couldn't start Diskscape (${esc(e.message)}).<br>Run <code>diskscape</code> again to open a new window.</div>`;
+  });

@@ -7,11 +7,15 @@ the real Diskscape server, then captured with Chrome for Testing's headless shel
 
     python3 scripts/screenshot.py --chrome /path/to/chrome-headless-shell
 
-Writes docs/screenshot-dark.png (sunburst) and docs/screenshot-light.png (treemap).
+Writes docs/screenshot-dark.png (sunburst), docs/screenshot-light.png (treemap) and
+docs/social-preview.png, a 1280x640 card for GitHub's Settings > Social preview.
 """
 import argparse
+import html
 import os
+import pathlib
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -153,6 +157,43 @@ def demo_scanner():
     return s
 
 
+def capture(chrome, url, out, width, height, scale, scheme="0"):
+    with tempfile.TemporaryDirectory() as profile:
+        subprocess.run([
+            chrome, "--headless", "--hide-scrollbars", "--no-first-run",
+            f"--user-data-dir={profile}", f"--window-size={width},{height}", f"--force-device-scale-factor={scale}",
+            f"--blink-settings=preferredColorScheme={scheme}",  # 0 = dark, 1 = light
+            "--virtual-time-budget=5000", f"--screenshot={out}", url,
+        ], check=True, capture_output=True)
+    print("wrote", os.path.relpath(out, REPO))
+
+
+def repo_slug():
+    """'github.com/owner/name' from the origin remote, or '' if there isn't one."""
+    try:
+        url = subprocess.run(["git", "-C", REPO, "remote", "get-url", "origin"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    m = re.search(r"github\.com[:/](.+?)(?:\.git)?$", url)
+    return f"github.com/{m.group(1)}" if m else ""
+
+
+def social_card(chrome, out_dir):
+    """Compose the GitHub social preview from the dark screenshot."""
+    template = pathlib.Path(REPO, "scripts", "social-card.html").read_text()
+    shot = pathlib.Path(out_dir, "screenshot-dark.png").resolve().as_uri()
+    page = template.replace("{{SCREENSHOT}}", shot).replace("{{REPO}}", html.escape(repo_slug()))
+    out = os.path.join(out_dir, "social-preview.png")
+    with tempfile.TemporaryDirectory() as tmp:
+        card = pathlib.Path(tmp, "card.html")
+        card.write_text(page)
+        capture(chrome, card.as_uri(), out, 1280, 640, 1)
+    size = os.path.getsize(out)
+    if size > 1_000_000:
+        print(f"warning: {size / 1e6:.2f} MB is over GitHub's 1 MB limit for social previews")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--chrome", required=True, help="path to chrome-headless-shell")
@@ -172,16 +213,9 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     shots = [("screenshot-dark.png", "sunburst", "0"), ("screenshot-light.png", "treemap", "1")]
     for fname, view, scheme in shots:
-        out = os.path.join(args.out, fname)
-        with tempfile.TemporaryDirectory() as profile:
-            subprocess.run([
-                args.chrome, "--headless", "--hide-scrollbars", "--no-first-run",
-                f"--user-data-dir={profile}", "--window-size=1440,900", "--force-device-scale-factor=2",
-                f"--blink-settings=preferredColorScheme={scheme}",  # 0 = dark, 1 = light
-                "--virtual-time-budget=5000", f"--screenshot={out}", f"{base}#view={view}",
-            ], check=True, capture_output=True)
-        print("wrote", os.path.relpath(out, REPO))
+        capture(args.chrome, f"{base}#view={view}", os.path.join(args.out, fname), 1440, 900, 2, scheme)
     httpd.shutdown()
+    social_card(args.chrome, args.out)
 
 
 if __name__ == "__main__":
