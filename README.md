@@ -73,7 +73,7 @@ Options:
 
 ### Stopping
 
-Close the Diskscape window, or press Ctrl+C in the terminal. Either way, Diskscape quits its browser window and deletes the temporary profile.
+Close the Diskscape window, or press Ctrl+C in the terminal. Either way, Diskscape quits its browser window and deletes the temporary profile. If either step fails, it prints a warning naming what was left behind and exits with status 1.
 
 It also stops itself after 15 minutes without activity, so it doesn't sit in the background forever. Activity means using the window (moving the mouse, scrolling, typing); a window you've left open doesn't count. A running scan never times out, and the timer restarts when the scan finishes.
 
@@ -87,7 +87,8 @@ Diskscape runs a small HTTP server so the browser can talk to the scanner. It is
 
 - It listens on `127.0.0.1` only, never on your network.
 - It opens in its own browser instance with a fresh, temporary profile: no extensions, and no history, cookies or storage shared with your normal browsing. The profile is deleted when Diskscape stops.
-- Every API request needs a random token created at startup, so other websites can't call it. The window's command line, which other users on the Mac can see, carries only a single-use launch code. The page exchanges it for the token as it opens, so the code is already spent by the time anyone could copy it.
+- Every API request needs a random token created at startup, so other websites can't call it. The token never appears on a command line, where other users on the Mac could see it. The window opens a start page in a private folder (readable only by you), which forwards to the app, and that page is deleted as soon as the window connects. Software running as *your* user could still read it in that moment, but such software could read your files anyway.
+- Request bodies are capped at 64 KB, and a client that stalls mid-request is disconnected after 30 seconds.
 - It checks the `Host` header, which blocks DNS-rebinding attacks.
 - *Reveal* and *Trash* only accept paths inside the folder you scanned, and never the scanned folder itself.
 - Before acting, Diskscape re-checks the path on disk, walking down from the scanned folder without following symlinks. It refuses if a folder on the way has been swapped for a symlink, if the item has changed type, or if the item is itself a symlink.
@@ -104,7 +105,7 @@ diskscape/
   server.py      http.server JSON API + static files, CLI entry point
   window.py      opens the app window on a temporary profile, cleans it up
   static/        index.html, style.css, app.js (canvas sunburst + treemap)
-tests/           unittest suites for the scanner, the HTTP API and the window
+tests/           unittest suites for the scanner, the HTTP API, the window, and a real-browser test
 ```
 
 The window holds one streaming request open to the server for as long as it is open. When that connection drops and doesn't come back within a few seconds (a reload reconnects), Diskscape knows the window has closed. It then stops, finds its browser instance by the unique profile path, quits it and deletes the profile.
@@ -117,6 +118,7 @@ There is nothing to install.
 
 ```sh
 python3 -m unittest -v               # run the tests
+DISKSCAPE_BROWSER_TESTS=1 python3 -m unittest -v tests.test_browser  # also drive real (headless) Chrome
 python3 -m diskscape --no-browser .  # run against this repo
 ```
 

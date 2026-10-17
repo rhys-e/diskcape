@@ -24,3 +24,7 @@ jobs:
         run: node --check diskscape/static/app.js
       - name: CLI smoke test
         run: python -m diskscape --version
+      - name: Real-browser test (headless Chrome preinstalled on the runner)
+        run: python -m unittest -v tests.test_browser
+        env:
+          DISKSCAPE_BROWSER_TESTS: "1"

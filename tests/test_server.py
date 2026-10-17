@@ -8,7 +8,9 @@ import time
 import unittest
 
 import socket
+from unittest import mock
 
+from diskscape import server
 from diskscape.server import CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, stop_when_done
 
 
@@ -111,10 +113,39 @@ class ServerTest(unittest.TestCase):
             os.remove(f"{self.root}/sub/file.txt")
             os.rename(f"{self.root}/sub/file.bak", f"{self.root}/sub/file.txt")
 
+    def raw(self, data, timeout=5):
+        """Send raw bytes; return the status line (or b"" if the server hung up)."""
+        with socket.create_connection(("127.0.0.1", self.app.port), timeout=timeout) as sock:
+            sock.sendall(data)
+            return sock.recv(1024).split(b"\r\n")[0]
+
+    def test_request_body_limits(self):
+        host = f"Host: 127.0.0.1:{self.app.port}\r\n".encode()
+        auth = b"X-Token: test-token\r\n"
+        # Too large: refused from the header alone, without waiting for a body that never comes.
+        self.assertIn(b"413", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + auth + b"Content-Length: 999999999\r\n\r\n"))
+        self.assertIn(b"400", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + auth + b"Content-Length: -5\r\n\r\n"))
+        # Without the token, the body is never read at all.
+        self.assertIn(b"403", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + b"Content-Length: 999999999\r\n\r\n"))
+
     def test_scan_rejects_non_folder(self):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
         self.assertEqual(code, 400)
         self.assertEqual(self.request("POST", "/api/scan", ["not", "an", "object"])[0], 400)
+
+
+class TimeoutTest(unittest.TestCase):
+    def test_stalled_client_is_disconnected(self):
+        with mock.patch.object(server, "REQUEST_TIMEOUT", 0.2):
+            httpd = make_server(App(token="t"), 0)
+        self.addCleanup(httpd.server_close)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+        with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5) as sock:
+            sock.sendall(b"GET / HTTP/1.1\r\n")  # ...and never finish the request
+            start = time.time()
+            self.assertEqual(sock.recv(1024), b"")  # server hangs up
+            self.assertLess(time.time() - start, 3)
 
 
 class OsascriptPathTest(unittest.TestCase):
@@ -244,15 +275,6 @@ class WindowTest(unittest.TestCase):
         self.addCleanup(self.thread.join, 5)
         self.addCleanup(self.app.request_stop, "test over")
 
-    def post(self, path, body, headers=()):
-        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
-        try:
-            conn.request("POST", path, json.dumps(body), {"Host": f"127.0.0.1:{self.app.port}", **dict(headers)})
-            resp = conn.getresponse()
-            return resp.status, json.loads(resp.read())
-        finally:
-            conn.close()
-
     def open_window(self):
         """Open the event stream the way the page does; returns the socket."""
         sock = socket.create_connection(("127.0.0.1", self.app.port), timeout=5)
@@ -266,13 +288,15 @@ class WindowTest(unittest.TestCase):
             time.sleep(0.01)
         self.assertTrue(condition())
 
-    def test_launch_code_works_once(self):
-        code = self.app.new_launch_code()
-        self.assertEqual(self.post("/api/claim", {"code": code}), (200, {"token": "t"}))
-        self.assertEqual(self.post("/api/claim", {"code": code})[0], 403)
-        self.assertEqual(self.post("/api/claim", {"code": "guess"})[0], 403)
-        code = self.app.new_launch_code()
-        self.assertEqual(self.post("/api/claim", {"code": code}, {"Host": "evil.example"})[0], 403)
+    def test_first_connection_runs_hook_once(self):
+        calls = []
+        self.app.on_first_window = lambda: calls.append(1)
+        first = self.open_window()
+        self.addCleanup(first.close)
+        second = self.open_window()
+        self.addCleanup(second.close)
+        self.wait_for(lambda: self.app.windows == 2)
+        self.assertEqual(calls, [1])
 
     def test_events_require_token(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)

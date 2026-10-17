@@ -34,6 +34,8 @@ DEFAULT_IDLE_MINUTES = 15
 CLOSE_GRACE = 3.0  # seconds a window may be disconnected (e.g. reloading) before we stop
 CONNECT_TIMEOUT = 60.0  # seconds for a freshly launched window to connect
 HEARTBEAT = 2.0  # seconds between keep-alive comments on the window's event stream
+REQUEST_TIMEOUT = 30.0  # seconds a client may take to send a request
+MAX_BODY = 64 * 1024  # bytes; API request bodies are tiny JSON objects
 
 
 def osascript_path(stdout):
@@ -62,10 +64,10 @@ class App:
         self.clock = clock  # injectable so tests don't depend on real time
         self.started = self.last_active = clock()
         self.track_window = False  # stop when the app window closes
+        self.on_first_window = None  # called once, when a window first connects
         self.windows = 0  # open event streams, i.e. open windows
         self.window_seen = False
         self.window_gone_at = None
-        self.launch_codes = set()
         self.stop_reason = None
         self.stopping = threading.Event()
         self._lock = threading.Lock()
@@ -73,29 +75,14 @@ class App:
     def touch(self):
         self.last_active = self.clock()
 
-    def new_launch_code(self):
-        """A single-use code to put in the window's URL instead of the token.
-
-        Browser command lines are visible to other users via `ps`; by the time anyone
-        reads this code from there, the window has already exchanged it.
-        """
-        code = secrets.token_urlsafe(16)
-        self.launch_codes.add(code)
-        return code
-
-    def claim(self, code):
-        with self._lock:
-            for known in self.launch_codes:
-                if secrets.compare_digest(known, code):
-                    self.launch_codes.discard(known)
-                    return self.token
-        return None
-
     def window_opened(self):
         with self._lock:
+            first = not self.window_seen
             self.windows += 1
             self.window_seen = True
             self.window_gone_at = None
+        if first and self.on_first_window:
+            self.on_first_window()
 
     def window_closed(self):
         with self._lock:
@@ -158,6 +145,7 @@ def _float(qs, key, default):
 def make_handler(app):
     class Handler(BaseHTTPRequestHandler):
         server_version = "Diskscape/" + __version__
+        timeout = REQUEST_TIMEOUT  # socket timeout, so a slow or stalled client can't hold a thread
 
         def log_message(self, *args):
             pass
@@ -183,7 +171,7 @@ def make_handler(app):
             # Host check defeats DNS rebinding; the token defeats cross-site requests.
             if self.headers.get("Host", "") not in (f"127.0.0.1:{app.port}", f"localhost:{app.port}"):
                 return False
-            if path.startswith("/api/") and path != "/api/claim":  # claim checks its own code
+            if path.startswith("/api/"):
                 return secrets.compare_digest(self.headers.get("X-Token", ""), app.token)
             return True
 
@@ -193,7 +181,7 @@ def make_handler(app):
                 return self._send(403, {"error": "Forbidden"})
             if url.path == "/api/events" and self.command == "GET":
                 return self._events()
-            if url.path.startswith("/api/") and url.path not in ("/api/ping", "/api/claim"):
+            if url.path.startswith("/api/") and url.path != "/api/ping":
                 app.touch()  # only token-bearing requests count as activity
             try:
                 result = fn(url)
@@ -269,18 +257,17 @@ def make_handler(app):
             return body
 
         def _post(self, url):
+            length = self.headers.get("Content-Length") or "0"
+            if not length.isdigit():
+                raise ApiError(400, "Bad Content-Length")
+            if int(length) > MAX_BODY:
+                raise ApiError(413, "Request body too large")
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                data = json.loads(self.rfile.read(length) or b"{}")
+                data = json.loads(self.rfile.read(int(length)) or b"{}")
                 if not isinstance(data, dict):
                     raise ValueError
             except ValueError:
                 raise ApiError(400, "Bad JSON body")
-            if url.path == "/api/claim":
-                token = app.claim(str(data.get("code", "")))
-                if not token:
-                    raise ApiError(403, "This launch link has already been used. Run diskscape again.")
-                return {"token": token}
             if url.path == "/api/scan":
                 path = os.path.realpath(os.path.expanduser(str(data.get("path") or "~")))
                 if not os.path.isdir(path):
@@ -402,11 +389,12 @@ def main(argv=None):
         print(f"Diskscape running at http://127.0.0.1:{app.port}/?t={app.token}", flush=True)
     else:
         try:
-            window = AppWindow(f"http://127.0.0.1:{app.port}/?launch={app.new_launch_code()}")
+            window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}")
         except NoBrowserError as e:
             httpd.server_close()
             sys.exit(f"diskscape: {e}")
         app.track_window = True
+        app.on_first_window = window.remove_start_page
         print("Diskscape is open in its own window. Close it, or press Ctrl+C here, to stop.", flush=True)
 
     stop_when_done(app, httpd)
@@ -418,9 +406,12 @@ def main(argv=None):
     finally:
         app.stopping.set()
         httpd.server_close()
-        if window:
-            window.close()
+        problems = window.close() if window else []
     if app.stop_reason == "idle":
         print(f"Stopped after {args.idle_timeout:g} minutes of inactivity.")
     else:
         print(STOP_MESSAGES.get(app.stop_reason, "Stopped."))
+    for problem in problems:
+        print(f"diskscape: warning: {problem}", file=sys.stderr)
+    if problems:
+        sys.exit(1)
