@@ -39,7 +39,7 @@ Scanning and browsing also work on Linux. *Reveal* and *Trash* are macOS-only.
 Run it straight from a clone, with no install:
 
 ```sh
-git clone https://github.com/<you>/diskscape.git
+git clone https://github.com/rhys-e/diskcape.git
 cd diskscape
 python3 -m diskscape            # start screen: pick a disk or folder
 python3 -m diskscape ~          # scan your home folder straight away
@@ -48,7 +48,7 @@ python3 -m diskscape ~          # scan your home folder straight away
 Or install it as a command with [pipx](https://pipx.pypa.io/):
 
 ```sh
-pipx install git+https://github.com/<you>/diskscape.git
+pipx install git+https://github.com/rhys-e/diskcape.git
 diskscape ~/Library
 ```
 
@@ -86,7 +86,7 @@ macOS hides some folders (Mail, Messages, Safari, other apps' containers) from a
 Diskscape runs a small HTTP server so the browser can talk to the scanner. It is locked down:
 
 - It listens on `127.0.0.1` only, never on your network.
-- It opens in its own browser instance with a fresh, temporary profile: no extensions, and no history, cookies or storage shared with your normal browsing. The profile is deleted when Diskscape stops.
+- It opens in a separate instance of a Chromium-based browser already installed on your machine (Chrome, Chromium, Edge or Brave). No browser is bundled or downloaded. That instance runs on a fresh, temporary profile: no extensions, and no history, cookies or storage shared with your normal browsing. The profile is deleted when Diskscape stops.
 - Every API request needs a random token created at startup, so other websites can't call it. The token never appears on a command line, where other users on the Mac could see it. The window opens a start page in a private folder (readable only by you), which forwards to the app, and that page is deleted as soon as the window connects. Software running as *your* user could still read it in that moment, but such software could read your files anyway.
 - Request bodies are capped at 64 KB, and a client that stalls mid-request is disconnected after 30 seconds.
 - It checks the `Host` header, which blocks DNS-rebinding attacks.
