@@ -24,3 +24,11 @@ jobs:
         run: node --check diskscape/static/app.js
       - name: CLI smoke test
         run: python -m diskscape --version
+      # Linux only: on GitHub's macOS runners `open` never completes an app launch
+      # (probably no desktop session), so the macOS path is tested by hand with DISKSCAPE_BROWSER_MANUAL=1.
+      - name: Real-browser test (headless Chrome preinstalled on the runner)
+        if: runner.os == 'Linux'
+        run: python -X faulthandler -m unittest -v tests.test_browser
+        timeout-minutes: 5
+        env:
+          DISKSCAPE_BROWSER_TESTS: "1"

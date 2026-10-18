@@ -3,16 +3,17 @@ import argparse
 import json
 import os
 import secrets
+import select
 import subprocess
 import sys
 import threading
 import time
-import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .scanner import Scanner, disk_usage, volumes
+from .window import AppWindow, LaunchError
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_FILES = {
@@ -30,6 +31,12 @@ TRASH_SCRIPT = """on run argv
     return POSIX path of (trashed as alias)
 end run"""
 DEFAULT_IDLE_MINUTES = 15
+CLOSE_GRACE = 3.0  # seconds a window may be disconnected (e.g. reloading) before we stop
+CONNECT_TIMEOUT = 60.0  # seconds for a freshly launched window to connect
+HEARTBEAT = 2.0  # seconds between keep-alive comments on the window's event stream
+REQUEST_TIMEOUT = 30.0  # seconds a client may take to send a request
+MAX_BODY = 64 * 1024  # bytes; API request bodies are tiny JSON objects
+POST_ROUTES = frozenset({"/api/scan", "/api/cancel", "/api/reveal", "/api/trash"})
 
 
 def osascript_path(stdout):
@@ -48,7 +55,7 @@ class ApiError(Exception):
 
 
 class App:
-    """Server state: the current scan, the per-run access token and the idle clock."""
+    """Server state: the scan, the access token, and what decides when to stop."""
 
     def __init__(self, token=None, idle_timeout=0, clock=time.time):
         self.token = token or secrets.token_urlsafe(16)
@@ -56,10 +63,57 @@ class App:
         self.scanner = None
         self.idle_timeout = idle_timeout  # seconds; 0 = never stop
         self.clock = clock  # injectable so tests don't depend on real time
-        self.last_active = clock()
+        self.started = self.last_active = clock()
+        self.track_window = False  # stop when the app window closes
+        self.on_first_window = None  # called once, when a window first connects
+        self.windows = 0  # open event streams, i.e. open windows
+        self.window_seen = False
+        self.window_gone_at = None
+        self.stop_reason = None
+        self.stopping = threading.Event()
+        self._lock = threading.Lock()
 
     def touch(self):
         self.last_active = self.clock()
+
+    def window_opened(self):
+        with self._lock:
+            first = not self.window_seen
+            self.windows += 1
+            self.window_seen = True
+            self.window_gone_at = None
+        if first and self.on_first_window:
+            try:
+                self.on_first_window()
+            except Exception as e:  # never let it break window accounting
+                self.warn(f"first-window hook failed ({e})")
+
+    @staticmethod
+    def warn(message):
+        print(f"diskscape: warning: {message}", file=sys.stderr, flush=True)
+
+    def window_closed(self):
+        with self._lock:
+            self.windows -= 1
+            if not self.windows:
+                self.window_gone_at = self.clock()
+
+    def request_stop(self, reason):
+        self.stop_reason = self.stop_reason or reason
+
+    def why_stop(self):
+        """Why the server should stop now, or None to keep running."""
+        if self.stop_reason:
+            return self.stop_reason
+        if self.idle_timeout and self.idle_for() >= self.idle_timeout:
+            return "idle"
+        if self.track_window:
+            now = self.clock()
+            if not self.window_seen and now - self.started >= CONNECT_TIMEOUT:
+                return "no window"
+            if self.window_gone_at is not None and now - self.window_gone_at >= CLOSE_GRACE:
+                return "window closed"
+        return None
 
     def idle_for(self):
         """Seconds since the user last did anything. A running scan is never idle."""
@@ -99,28 +153,34 @@ def _float(qs, key, default):
 def make_handler(app):
     class Handler(BaseHTTPRequestHandler):
         server_version = "Diskscape/" + __version__
+        timeout = REQUEST_TIMEOUT  # socket timeout, so a slow or stalled client can't hold a thread
 
         def log_message(self, *args):
             pass
 
-        def _send(self, code, body, ctype="application/json"):
-            if not isinstance(body, bytes):
-                body = json.dumps(body, separators=(",", ":")).encode()
+        def _headers(self, code, ctype, length=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
+            if length is not None:
+                self.send_header("Content-Length", str(length))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Security-Policy", CSP)
             self.end_headers()
+
+        def _send(self, code, body, ctype="application/json"):
+            if not isinstance(body, bytes):
+                body = json.dumps(body, separators=(",", ":")).encode()
+            self._headers(code, ctype, len(body))
             self.wfile.write(body)
 
         def _authorised(self, path):
             # Host check defeats DNS rebinding; the token defeats cross-site requests.
             if self.headers.get("Host", "") not in (f"127.0.0.1:{app.port}", f"localhost:{app.port}"):
                 return False
-            if path.startswith("/api/"):
+            # Every API call and every POST needs the token; only the static UI is public.
+            if path.startswith("/api/") or self.command != "GET":
                 return secrets.compare_digest(self.headers.get("X-Token", ""), app.token)
             return True
 
@@ -128,6 +188,8 @@ def make_handler(app):
             url = urlparse(self.path)
             if not self._authorised(url.path):
                 return self._send(403, {"error": "Forbidden"})
+            if url.path == "/api/events" and self.command == "GET":
+                return self._events()
             if url.path.startswith("/api/") and url.path != "/api/ping":
                 app.touch()  # only token-bearing requests count as activity
             try:
@@ -139,6 +201,29 @@ def make_handler(app):
             if isinstance(result, tuple):  # (code, raw bytes, content type) for static files
                 return self._send(*result)
             self._send(200, result)
+
+        def _events(self):
+            """Held open by the app window for as long as it is open.
+
+            The page never sends anything after its request, so the socket becoming
+            readable means the window closed (or reloaded) and the connection ended.
+            """
+            opened = False
+            try:
+                self._headers(200, "text/event-stream")
+                app.window_opened()
+                opened = True
+                while not app.stopping.is_set():
+                    readable, _, _ = select.select([self.connection], [], [], HEARTBEAT)
+                    if readable:
+                        break
+                    self.wfile.write(b": keep-alive\n\n")
+                    self.wfile.flush()
+            except OSError:
+                pass
+            finally:
+                if opened:
+                    app.window_closed()
 
         def do_GET(self):
             self._dispatch(self._get)
@@ -184,9 +269,15 @@ def make_handler(app):
             return body
 
         def _post(self, url):
+            if url.path not in POST_ROUTES:
+                return None  # 404 without reading a body nobody needs
+            length = self.headers.get("Content-Length") or "0"
+            if not length.isdigit():
+                raise ApiError(400, "Bad Content-Length")
+            if int(length) > MAX_BODY:
+                raise ApiError(413, "Request body too large")
             try:
-                length = int(self.headers.get("Content-Length") or 0)
-                data = json.loads(self.rfile.read(length) or b"{}")
+                data = json.loads(self.rfile.read(int(length)) or b"{}")
                 if not isinstance(data, dict):
                     raise ValueError
             except ValueError:
@@ -264,31 +355,42 @@ def make_server(app, port, attempts=20):
     raise OSError(f"No free port in {port}-{port + attempts - 1}")
 
 
-def stop_when_idle(app, httpd, poll=None):
-    """Shut the server down once app.idle_for() exceeds app.idle_timeout.
-
-    Returns an Event that is set if the shutdown was due to inactivity.
-    """
-    stopped = threading.Event()
-    if not app.idle_timeout:
-        return stopped
-    poll = poll or min(30.0, app.idle_timeout / 10)
-
+def stop_when_done(app, httpd, poll=0.5):
+    """Shut the server down once app.why_stop() gives a reason, recorded in app.stop_reason."""
     def watch():
-        while app.idle_for() < app.idle_timeout:
+        while not app.why_stop():
             time.sleep(poll)
-        stopped.set()
+        app.request_stop(app.why_stop())
+        app.stopping.set()  # ends open event streams
         httpd.shutdown()
 
     threading.Thread(target=watch, daemon=True).start()
-    return stopped
+
+
+def remove_start_page(window):
+    """First-window hook: delete the start page, which holds the token, as soon as it's used."""
+    def hook():
+        try:
+            window.remove_start_page()
+        except OSError as e:
+            App.warn(f"couldn't delete {window.start_page}, which holds the session token ({e}); "
+                     "it will be deleted when Diskscape stops")
+    return hook
+
+
+STOP_MESSAGES = {
+    "window closed": "Window closed; Diskscape stopped.",
+    "no window": "The Diskscape window never connected; stopped.",
+    "interrupted": "Stopped.",
+}
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="diskscape", description="Zero-dependency disk space analyser.")
     ap.add_argument("path", nargs="?", help="folder to scan straight away (default: show the start screen)")
     ap.add_argument("--port", type=int, default=8765, help="port to listen on (default: 8765, or next free)")
-    ap.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="don't open a window; print a URL to open yourself (for debugging)")
     ap.add_argument("--idle-timeout", type=float, default=DEFAULT_IDLE_MINUTES, metavar="MIN",
                     help=f"stop after MIN minutes without activity (default: {DEFAULT_IDLE_MINUTES}; 0 = never)")
     ap.add_argument("--version", action="version", version="%(prog)s " + __version__)
@@ -307,17 +409,34 @@ def main(argv=None):
     except OSError as e:
         sys.exit(str(e))
 
-    url = f"http://127.0.0.1:{app.port}/?t={app.token}"
-    idle_note = f" (or idle for {args.idle_timeout:g} min)" if args.idle_timeout else ""
-    print(f"Diskscape running at {url}\nPress Ctrl+C to stop{idle_note}.", flush=True)
-    if not args.no_browser:
-        threading.Timer(0.3, webbrowser.open, [url]).start()
-    idle_stop = stop_when_idle(app, httpd)
+    window = None
+    if args.no_browser:
+        print(f"Diskscape running at http://127.0.0.1:{app.port}/?t={app.token}", flush=True)
+    else:
+        try:
+            window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}")
+        except LaunchError as e:
+            httpd.server_close()
+            sys.exit(f"diskscape: {e}")
+        app.track_window = True
+        app.on_first_window = remove_start_page(window)
+        print("Diskscape is open in its own window. Close it, or press Ctrl+C here, to stop.", flush=True)
+
+    stop_when_done(app, httpd)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         print()
+        app.request_stop("interrupted")
     finally:
+        app.stopping.set()
         httpd.server_close()
-    if idle_stop.is_set():
+        problems = window.close() if window else []
+    if app.stop_reason == "idle":
         print(f"Stopped after {args.idle_timeout:g} minutes of inactivity.")
+    else:
+        print(STOP_MESSAGES.get(app.stop_reason, "Stopped."))
+    for problem in problems:
+        print(f"diskscape: warning: {problem}", file=sys.stderr)
+    if problems:
+        sys.exit(1)

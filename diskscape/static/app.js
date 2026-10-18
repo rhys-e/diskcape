@@ -796,7 +796,20 @@ function showStopped() {
   $('#stopped').hidden = false;
 }
 
+// ---------- session ----------
+// The server treats this open request as "the window is open". When the window
+// closes, the connection drops and Diskscape shuts itself down.
+async function holdConnection() {
+  try {
+    const r = await fetch('/api/events', { headers: { 'X-Token': TOKEN } });
+    const reader = r.body.getReader();
+    while (!(await reader.read()).done) { /* keep-alive comments */ }
+  } catch { /* server gone */ }
+  showStopped();
+}
+
+holdConnection();
 init().catch((e) => {
   if (!$('#stopped').hidden) return;
-  document.body.innerHTML = `<div class="empty" style="margin:auto">Couldn't reach the Diskscape server (${esc(e.message)}).<br>Open the URL printed in the terminal, including its <code>?t=</code> token.</div>`;
+  document.body.innerHTML = `<div class="empty" style="margin:auto">Couldn't start Diskscape (${esc(e.message)}).<br>Run <code>diskscape</code> again to open a new window.</div>`;
 });

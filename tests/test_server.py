@@ -7,7 +7,12 @@ import threading
 import time
 import unittest
 
-from diskscape.server import App, make_server, osascript_path, stop_when_idle
+import socket
+from unittest import mock
+
+from diskscape import server
+from diskscape.server import (CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, remove_start_page,
+                              stop_when_done)
 
 
 class ServerTest(unittest.TestCase):
@@ -109,10 +114,49 @@ class ServerTest(unittest.TestCase):
             os.remove(f"{self.root}/sub/file.txt")
             os.rename(f"{self.root}/sub/file.bak", f"{self.root}/sub/file.txt")
 
+    def raw(self, data, timeout=5):
+        """Send raw bytes; return the status line (or b"" if the server hung up)."""
+        with socket.create_connection(("127.0.0.1", self.app.port), timeout=timeout) as sock:
+            sock.sendall(data)
+            return sock.recv(1024).split(b"\r\n")[0]
+
+    def test_request_body_limits(self):
+        host = f"Host: 127.0.0.1:{self.app.port}\r\n".encode()
+        auth = b"X-Token: test-token\r\n"
+        # Too large: refused from the header alone, without waiting for a body that never comes.
+        self.assertIn(b"413", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + auth + b"Content-Length: 999999999\r\n\r\n"))
+        self.assertIn(b"400", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + auth + b"Content-Length: -5\r\n\r\n"))
+        # Without the token, the body is never read at all.
+        self.assertIn(b"403", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + b"Content-Length: 999999999\r\n\r\n"))
+
+    def test_posts_answered_without_reading_unneeded_bodies(self):
+        """Each request promises a 100-byte body and never sends it: a reply proves no read."""
+        host = f"Host: 127.0.0.1:{self.app.port}\r\n".encode()
+        promise = b"Content-Length: 100\r\n\r\n"
+        for path in (b"/", b"/app.js", b"/api/nope"):  # no token: every POST needs one
+            self.assertIn(b"403", self.raw(b"POST " + path + b" HTTP/1.1\r\n" + host + promise, timeout=3), path)
+        auth = b"X-Token: test-token\r\n"
+        for path in (b"/", b"/api/nope", b"/api/status"):  # token, but no such POST route
+            self.assertIn(b"404", self.raw(b"POST " + path + b" HTTP/1.1\r\n" + host + auth + promise, timeout=3), path)
+
     def test_scan_rejects_non_folder(self):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
         self.assertEqual(code, 400)
         self.assertEqual(self.request("POST", "/api/scan", ["not", "an", "object"])[0], 400)
+
+
+class TimeoutTest(unittest.TestCase):
+    def test_stalled_client_is_disconnected(self):
+        with mock.patch.object(server, "REQUEST_TIMEOUT", 0.2):
+            httpd = make_server(App(token="t"), 0)
+        self.addCleanup(httpd.server_close)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.shutdown)
+        with socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=5) as sock:
+            sock.sendall(b"GET / HTTP/1.1\r\n")  # ...and never finish the request
+            start = time.time()
+            self.assertEqual(sock.recv(1024), b"")  # server hangs up
+            self.assertLess(time.time() - start, 3)
 
 
 class OsascriptPathTest(unittest.TestCase):
@@ -145,12 +189,15 @@ class IdleTest(unittest.TestCase):
         self.addCleanup(self.httpd.server_close)
 
     def serve(self, watch=True):
-        stopped = stop_when_idle(self.app, self.httpd, poll=0.01) if watch else None
         thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         thread.start()
-        if not watch:
+        if watch:
+            stop_when_done(self.app, self.httpd, poll=0.01)
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(self.app.request_stop, "test over")
+        else:
             self.addCleanup(self.httpd.shutdown)
-        return thread, stopped
+        return thread
 
     def ping(self, active):
         conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
@@ -162,17 +209,17 @@ class IdleTest(unittest.TestCase):
             conn.close()
 
     def test_stops_when_idle(self):
-        thread, stopped = self.serve()
+        thread = self.serve()
         self.clock.advance(59)
         time.sleep(0.1)  # several watcher polls
         self.assertTrue(thread.is_alive())
         self.clock.advance(2)
         thread.join(5)
         self.assertFalse(thread.is_alive())
-        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.app.stop_reason, "idle")
 
     def test_activity_keeps_it_alive(self):
-        thread, stopped = self.serve()
+        thread = self.serve()
         for _ in range(5):  # 200s of activity in total, well past the 60s timeout
             self.clock.advance(40)
             self.ping(active=True)
@@ -180,7 +227,7 @@ class IdleTest(unittest.TestCase):
         self.assertTrue(thread.is_alive())
         self.clock.advance(61)  # then it goes idle and stops
         thread.join(5)
-        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.app.stop_reason, "idle")
 
     def test_unauthenticated_requests_do_not_count(self):
         self.serve(watch=False)
@@ -217,7 +264,109 @@ class IdleTest(unittest.TestCase):
 
     def test_disabled(self):
         self.app.idle_timeout = 0
-        self.assertFalse(stop_when_idle(self.app, self.httpd).is_set())
+        thread = self.serve()
+        self.clock.advance(10 ** 6)
+        time.sleep(0.1)
+        self.assertTrue(thread.is_alive())
+        self.assertIsNone(self.app.stop_reason)
+
+
+class WindowTest(unittest.TestCase):
+    """The app window: launch-code exchange, and stopping when the window closes."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.app = App(token="t", clock=self.clock)
+        self.app.track_window = True
+        self.httpd = make_server(self.app, 0)
+        self.addCleanup(self.httpd.server_close)
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        stop_when_done(self.app, self.httpd, poll=0.01)
+        self.addCleanup(self.thread.join, 5)
+        self.addCleanup(self.app.request_stop, "test over")
+
+    def open_window(self):
+        """Open the event stream the way the page does; returns the socket."""
+        sock = socket.create_connection(("127.0.0.1", self.app.port), timeout=5)
+        sock.sendall(f"GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{self.app.port}\r\nX-Token: t\r\n\r\n".encode())
+        self.assertIn(b"200", sock.recv(1024).split(b"\r\n")[0])
+        return sock
+
+    def wait_for(self, condition):
+        deadline = time.time() + 5
+        while not condition() and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(condition())
+
+    def test_first_connection_runs_hook_once(self):
+        calls = []
+        self.app.on_first_window = lambda: calls.append(1)
+        first = self.open_window()
+        self.addCleanup(first.close)
+        second = self.open_window()
+        self.addCleanup(second.close)
+        self.wait_for(lambda: self.app.windows == 2)
+        self.assertEqual(calls, [1])
+
+    def test_failing_hook_does_not_break_window_tracking(self):
+        def broken():
+            raise PermissionError("can't delete start page")
+        self.app.on_first_window = broken
+        with mock.patch.object(App, "warn") as warn:
+            sock = self.open_window()
+            self.wait_for(lambda: self.app.windows == 1)
+            warn.assert_called_once()
+        sock.close()
+        self.wait_for(lambda: self.app.windows == 0)
+        self.clock.advance(CLOSE_GRACE + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "window closed")
+
+    def test_start_page_hook_warns_instead_of_raising(self):
+        class Window:
+            start_page = "/tmp/x/start.html"
+
+            def remove_start_page(self):
+                raise PermissionError("denied")
+        with mock.patch.object(App, "warn") as warn:
+            remove_start_page(Window())()
+        self.assertIn("holds the session token", warn.call_args[0][0])
+
+    def test_events_require_token(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)
+        conn.request("GET", "/api/events", headers={"Host": f"127.0.0.1:{self.app.port}"})
+        self.assertEqual(conn.getresponse().status, 403)
+        conn.close()
+        self.assertEqual(self.app.windows, 0)
+
+    def test_stops_when_window_closes(self):
+        sock = self.open_window()
+        self.wait_for(lambda: self.app.windows == 1)
+        self.clock.advance(3600)  # an open window keeps it running
+        time.sleep(0.1)
+        self.assertIsNone(self.app.stop_reason)
+        sock.close()
+        self.wait_for(lambda: self.app.windows == 0)
+        self.clock.advance(CLOSE_GRACE + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "window closed")
+
+    def test_reload_within_grace_keeps_running(self):
+        self.open_window().close()
+        self.wait_for(lambda: self.app.window_gone_at is not None)
+        self.clock.advance(CLOSE_GRACE / 2)
+        sock = self.open_window()  # the reloaded page reconnects
+        self.addCleanup(sock.close)
+        self.wait_for(lambda: self.app.windows == 1)
+        self.clock.advance(CLOSE_GRACE * 10)
+        time.sleep(0.1)
+        self.assertIsNone(self.app.stop_reason)
+
+    def test_stops_if_window_never_connects(self):
+        self.clock.advance(CONNECT_TIMEOUT + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "no window")
 
 
 if __name__ == "__main__":
