@@ -2,6 +2,9 @@
 
     DISKSCAPE_BROWSER_TESTS=1 python3 -m unittest -v tests.test_browser
 
+CI runs this on Linux only (headless). On macOS, run it from a desktop session: GitHub's
+macOS runners never complete an `open` launch.
+
 On macOS a real window opens (as for users); elsewhere the browser runs headless, since
 CI machines have no display. Override with DISKSCAPE_BROWSER_HEADLESS=0/1. The test then
 quits the browser to stand in for closing the window; with DISKSCAPE_BROWSER_MANUAL=1 it
@@ -41,6 +44,7 @@ class RealBrowserTest(unittest.TestCase):
         app = App()
         app.track_window = True
         httpd = make_server(app, 0)
+        self.addCleanup(httpd.server_close)  # also when the launch itself fails
         window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}",
                            extra_flags=["--headless=new"] if HEADLESS else [])
         # As in main(): install the hook before serving, so even a fast browser can't
@@ -65,7 +69,6 @@ class RealBrowserTest(unittest.TestCase):
         finally:
             app.request_stop("test over")
             serving.join(5)
-            httpd.server_close()
             problems = window.close()
         self.assertEqual(problems, [])
         self.assertFalse(os.path.exists(window.base), "temporary profile left behind")

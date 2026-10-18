@@ -98,7 +98,10 @@ class AppWindow:
                     r = run(["open", "-n", "-b", bundle_id, "--args", *args],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT)
                 except subprocess.TimeoutExpired:
-                    raise LaunchError(f"timed out after {LAUNCH_TIMEOUT:g}s waiting for macOS to open {bundle_id}")
+                    raise LaunchError(
+                        f"timed out after {LAUNCH_TIMEOUT:g}s waiting for macOS to open {bundle_id}. This can happen "
+                        "outside a normal desktop login (e.g. over SSH or in CI); there, use --no-browser "
+                        "and open the printed URL yourself.")
                 if r.returncode == 0:
                     return bundle_id
         else:
