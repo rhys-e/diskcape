@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .scanner import Scanner, disk_usage, volumes
-from .window import AppWindow, NoBrowserError
+from .window import AppWindow, LaunchError
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 STATIC_FILES = {
@@ -415,7 +415,7 @@ def main(argv=None):
     else:
         try:
             window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}")
-        except NoBrowserError as e:
+        except LaunchError as e:
             httpd.server_close()
             sys.exit(f"diskscape: {e}")
         app.track_window = True

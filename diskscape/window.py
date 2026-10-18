@@ -43,7 +43,14 @@ START_PAGE = """<!doctype html>
 """
 
 
-class NoBrowserError(RuntimeError):
+LAUNCH_TIMEOUT = 30.0  # seconds to wait for `open` to hand the window over to the browser
+
+
+class LaunchError(RuntimeError):
+    pass
+
+
+class NoBrowserError(LaunchError):
     pass
 
 
@@ -53,17 +60,19 @@ class AppWindow:
     `url` is the full app URL including the token; it only ever goes into a private file.
     """
 
-    def __init__(self, url, run=subprocess.run, popen=subprocess.Popen, platform=sys.platform, extra_flags=()):
+    def __init__(self, url, run=subprocess.run, popen=subprocess.Popen, platform=sys.platform, extra_flags=(),
+                 list_processes=None):
         self.base = tempfile.mkdtemp(prefix="diskscape-")  # mode 0700
         self.profile = os.path.join(self.base, "profile")
         self.start_page = os.path.join(self.base, "start.html")
+        self.list_processes = list_processes  # injectable for tests; default runs `ps`
         try:
             self._write_start_page(url)
             args = [f"--app={pathlib.Path(self.start_page).as_uri()}", f"--user-data-dir={self.profile}",
                     *FLAGS, *extra_flags]
             self.browser = self._launch(args, run, popen, platform)
         except BaseException:
-            shutil.rmtree(self.base, ignore_errors=True)
+            self.close(timeout=2.0)  # a launch that timed out may still have started a browser
             raise
 
     def _write_start_page(self, url):
@@ -85,8 +94,11 @@ class AppWindow:
         if platform == "darwin":
             for bundle_id in MAC_BUNDLE_IDS:
                 # -n: a new instance even if the browser is already open (it is: different profile).
-                r = run(["open", "-n", "-b", bundle_id, "--args", *args],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    r = run(["open", "-n", "-b", bundle_id, "--args", *args],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    raise LaunchError(f"timed out after {LAUNCH_TIMEOUT:g}s waiting for macOS to open {bundle_id}")
                 if r.returncode == 0:
                     return bundle_id
         else:
@@ -106,7 +118,7 @@ class AppWindow:
         """
         problems = []
         try:
-            pids = browser_pids(self.profile, list_processes)
+            pids = browser_pids(self.profile, list_processes or self.list_processes)
         except (OSError, subprocess.CalledProcessError) as e:
             pids = []
             problems.append(f"couldn't list processes to quit the Diskscape browser window ({e})")

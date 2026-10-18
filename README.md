@@ -118,7 +118,7 @@ There is nothing to install.
 
 ```sh
 python3 -m unittest -v               # run the tests
-DISKSCAPE_BROWSER_TESTS=1 python3 -m unittest -v tests.test_browser  # also drive real (headless) Chrome
+DISKSCAPE_BROWSER_TESTS=1 python3 -m unittest -v tests.test_browser  # also drive a real browser
 python3 -m diskscape --no-browser .  # run against this repo
 ```
 

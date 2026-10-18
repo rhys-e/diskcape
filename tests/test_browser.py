@@ -2,9 +2,12 @@
 
     DISKSCAPE_BROWSER_TESTS=1 python3 -m unittest -v tests.test_browser
 
-Headless by default. With DISKSCAPE_BROWSER_HEADLESS=0 a real window opens and the test
-waits for you to close it, which checks the macOS close-the-window path by hand.
+On macOS a real window opens (as for users); elsewhere the browser runs headless, since
+CI machines have no display. Override with DISKSCAPE_BROWSER_HEADLESS=0/1. The test then
+quits the browser to stand in for closing the window; with DISKSCAPE_BROWSER_MANUAL=1 it
+waits for you to close the window yourself instead.
 """
+import faulthandler
 import os
 import signal
 import sys
@@ -16,7 +19,8 @@ from diskscape.server import CLOSE_GRACE, App, make_server, remove_start_page, s
 from diskscape.window import AppWindow, browser_pids, signal_all
 
 ENABLED = os.environ.get("DISKSCAPE_BROWSER_TESTS") == "1"
-HEADLESS = os.environ.get("DISKSCAPE_BROWSER_HEADLESS", "1") == "1"
+HEADLESS = os.environ.get("DISKSCAPE_BROWSER_HEADLESS", "0" if sys.platform == "darwin" else "1") == "1"
+MANUAL = os.environ.get("DISKSCAPE_BROWSER_MANUAL") == "1"
 
 
 def wait_for(condition, timeout):
@@ -28,6 +32,11 @@ def wait_for(condition, timeout):
 
 @unittest.skipUnless(ENABLED, "set DISKSCAPE_BROWSER_TESTS=1 to run against a real browser")
 class RealBrowserTest(unittest.TestCase):
+    def setUp(self):
+        # If anything hangs, print every thread's stack and exit rather than stalling CI.
+        faulthandler.dump_traceback_later(600 if MANUAL else 180, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
+
     def test_launch_connect_close_and_clean_up(self):
         app = App()
         app.track_window = True
@@ -45,13 +54,13 @@ class RealBrowserTest(unittest.TestCase):
             self.assertTrue(wait_for(lambda: app.windows >= 1, 30), "the window never connected")
             self.assertTrue(wait_for(lambda: not os.path.exists(window.start_page), 5),
                             "the start page (which holds the token) wasn't deleted")
-            if HEADLESS:
+            if MANUAL:
+                print("\n>>> Close the Diskscape window to finish the test.", file=sys.stderr, flush=True)
+            else:
                 pids = browser_pids(window.profile)
                 self.assertTrue(pids, "couldn't find the browser by its profile")
                 signal_all(pids, signal.SIGTERM)  # stands in for the user closing it
-            else:
-                print("\n>>> Close the Diskscape window to finish the test.", file=sys.stderr, flush=True)
-            serving.join(CLOSE_GRACE + (15 if HEADLESS else 120))
+            serving.join(CLOSE_GRACE + (300 if MANUAL else 15))
             self.assertEqual(app.stop_reason, "window closed")
         finally:
             app.request_stop("test over")

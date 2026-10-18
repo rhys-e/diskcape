@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from diskscape.window import AppWindow, NoBrowserError, browser_pids
+from diskscape.window import AppWindow, LaunchError, NoBrowserError, browser_pids
 
 URL = "http://127.0.0.1:1/?t=SECRET-TOKEN"
 
@@ -63,6 +63,15 @@ class LaunchTest(unittest.TestCase):
         page = pathlib.Path(w.start_page).read_text()
         self.assertNotIn("</script><b>", page)
         self.assertIn('\\"', page)
+
+    def test_launch_that_hangs_times_out_and_cleans_up(self):
+        def hanging_open(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        before = set(os.listdir(tempfile.gettempdir()))
+        with self.assertRaisesRegex(LaunchError, "timed out"):
+            AppWindow(URL, run=hanging_open, platform="darwin", list_processes=lambda: [])
+        new = {d for d in set(os.listdir(tempfile.gettempdir())) - before if d.startswith("diskscape-")}
+        self.assertEqual(new, set())
 
     def test_linux_uses_path(self):
         launched = []
