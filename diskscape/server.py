@@ -36,6 +36,7 @@ CONNECT_TIMEOUT = 60.0  # seconds for a freshly launched window to connect
 HEARTBEAT = 2.0  # seconds between keep-alive comments on the window's event stream
 REQUEST_TIMEOUT = 30.0  # seconds a client may take to send a request
 MAX_BODY = 64 * 1024  # bytes; API request bodies are tiny JSON objects
+POST_ROUTES = frozenset({"/api/scan", "/api/cancel", "/api/reveal", "/api/trash"})
 
 
 def osascript_path(stdout):
@@ -82,7 +83,14 @@ class App:
             self.window_seen = True
             self.window_gone_at = None
         if first and self.on_first_window:
-            self.on_first_window()
+            try:
+                self.on_first_window()
+            except Exception as e:  # never let it break window accounting
+                self.warn(f"first-window hook failed ({e})")
+
+    @staticmethod
+    def warn(message):
+        print(f"diskscape: warning: {message}", file=sys.stderr, flush=True)
 
     def window_closed(self):
         with self._lock:
@@ -171,7 +179,8 @@ def make_handler(app):
             # Host check defeats DNS rebinding; the token defeats cross-site requests.
             if self.headers.get("Host", "") not in (f"127.0.0.1:{app.port}", f"localhost:{app.port}"):
                 return False
-            if path.startswith("/api/"):
+            # Every API call and every POST needs the token; only the static UI is public.
+            if path.startswith("/api/") or self.command != "GET":
                 return secrets.compare_digest(self.headers.get("X-Token", ""), app.token)
             return True
 
@@ -199,9 +208,11 @@ def make_handler(app):
             The page never sends anything after its request, so the socket becoming
             readable means the window closed (or reloaded) and the connection ended.
             """
-            self._headers(200, "text/event-stream")
-            app.window_opened()
+            opened = False
             try:
+                self._headers(200, "text/event-stream")
+                app.window_opened()
+                opened = True
                 while not app.stopping.is_set():
                     readable, _, _ = select.select([self.connection], [], [], HEARTBEAT)
                     if readable:
@@ -211,7 +222,8 @@ def make_handler(app):
             except OSError:
                 pass
             finally:
-                app.window_closed()
+                if opened:
+                    app.window_closed()
 
         def do_GET(self):
             self._dispatch(self._get)
@@ -257,6 +269,8 @@ def make_handler(app):
             return body
 
         def _post(self, url):
+            if url.path not in POST_ROUTES:
+                return None  # 404 without reading a body nobody needs
             length = self.headers.get("Content-Length") or "0"
             if not length.isdigit():
                 raise ApiError(400, "Bad Content-Length")
@@ -353,6 +367,17 @@ def stop_when_done(app, httpd, poll=0.5):
     threading.Thread(target=watch, daemon=True).start()
 
 
+def remove_start_page(window):
+    """First-window hook: delete the start page, which holds the token, as soon as it's used."""
+    def hook():
+        try:
+            window.remove_start_page()
+        except OSError as e:
+            App.warn(f"couldn't delete {window.start_page}, which holds the session token ({e}); "
+                     "it will be deleted when Diskscape stops")
+    return hook
+
+
 STOP_MESSAGES = {
     "window closed": "Window closed; Diskscape stopped.",
     "no window": "The Diskscape window never connected; stopped.",
@@ -394,7 +419,7 @@ def main(argv=None):
             httpd.server_close()
             sys.exit(f"diskscape: {e}")
         app.track_window = True
-        app.on_first_window = window.remove_start_page
+        app.on_first_window = remove_start_page(window)
         print("Diskscape is open in its own window. Close it, or press Ctrl+C here, to stop.", flush=True)
 
     stop_when_done(app, httpd)

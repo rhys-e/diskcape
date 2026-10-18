@@ -11,7 +11,8 @@ import socket
 from unittest import mock
 
 from diskscape import server
-from diskscape.server import CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, stop_when_done
+from diskscape.server import (CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, remove_start_page,
+                              stop_when_done)
 
 
 class ServerTest(unittest.TestCase):
@@ -127,6 +128,16 @@ class ServerTest(unittest.TestCase):
         self.assertIn(b"400", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + auth + b"Content-Length: -5\r\n\r\n"))
         # Without the token, the body is never read at all.
         self.assertIn(b"403", self.raw(b"POST /api/scan HTTP/1.1\r\n" + host + b"Content-Length: 999999999\r\n\r\n"))
+
+    def test_posts_answered_without_reading_unneeded_bodies(self):
+        """Each request promises a 100-byte body and never sends it: a reply proves no read."""
+        host = f"Host: 127.0.0.1:{self.app.port}\r\n".encode()
+        promise = b"Content-Length: 100\r\n\r\n"
+        for path in (b"/", b"/app.js", b"/api/nope"):  # no token: every POST needs one
+            self.assertIn(b"403", self.raw(b"POST " + path + b" HTTP/1.1\r\n" + host + promise, timeout=3), path)
+        auth = b"X-Token: test-token\r\n"
+        for path in (b"/", b"/api/nope", b"/api/status"):  # token, but no such POST route
+            self.assertIn(b"404", self.raw(b"POST " + path + b" HTTP/1.1\r\n" + host + auth + promise, timeout=3), path)
 
     def test_scan_rejects_non_folder(self):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
@@ -297,6 +308,30 @@ class WindowTest(unittest.TestCase):
         self.addCleanup(second.close)
         self.wait_for(lambda: self.app.windows == 2)
         self.assertEqual(calls, [1])
+
+    def test_failing_hook_does_not_break_window_tracking(self):
+        def broken():
+            raise PermissionError("can't delete start page")
+        self.app.on_first_window = broken
+        with mock.patch.object(App, "warn") as warn:
+            sock = self.open_window()
+            self.wait_for(lambda: self.app.windows == 1)
+            warn.assert_called_once()
+        sock.close()
+        self.wait_for(lambda: self.app.windows == 0)
+        self.clock.advance(CLOSE_GRACE + 1)
+        self.thread.join(5)
+        self.assertEqual(self.app.stop_reason, "window closed")
+
+    def test_start_page_hook_warns_instead_of_raising(self):
+        class Window:
+            start_page = "/tmp/x/start.html"
+
+            def remove_start_page(self):
+                raise PermissionError("denied")
+        with mock.patch.object(App, "warn") as warn:
+            remove_start_page(Window())()
+        self.assertIn("holds the session token", warn.call_args[0][0])
 
     def test_events_require_token(self):
         conn = http.client.HTTPConnection("127.0.0.1", self.app.port, timeout=5)

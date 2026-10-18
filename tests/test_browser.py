@@ -12,7 +12,7 @@ import threading
 import time
 import unittest
 
-from diskscape.server import CLOSE_GRACE, App, make_server, stop_when_done
+from diskscape.server import CLOSE_GRACE, App, make_server, remove_start_page, stop_when_done
 from diskscape.window import AppWindow, browser_pids, signal_all
 
 ENABLED = os.environ.get("DISKSCAPE_BROWSER_TESTS") == "1"
@@ -32,12 +32,14 @@ class RealBrowserTest(unittest.TestCase):
         app = App()
         app.track_window = True
         httpd = make_server(app, 0)
+        window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}",
+                           extra_flags=["--headless=new"] if HEADLESS else [])
+        # As in main(): install the hook before serving, so even a fast browser can't
+        # connect first. (Until then, its connection just waits in the listen queue.)
+        app.on_first_window = remove_start_page(window)
         serving = threading.Thread(target=httpd.serve_forever, daemon=True)
         serving.start()
         stop_when_done(app, httpd, poll=0.05)
-        window = AppWindow(f"http://127.0.0.1:{app.port}/?t={app.token}",
-                           extra_flags=["--headless=new"] if HEADLESS else [])
-        app.on_first_window = window.remove_start_page
         try:
             # The file:// start page forwards to the app, which connects with the token.
             self.assertTrue(wait_for(lambda: app.windows >= 1, 30), "the window never connected")
