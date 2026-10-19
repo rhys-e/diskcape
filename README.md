@@ -39,7 +39,7 @@ Scanning and browsing also work on Linux. *Reveal* and *Trash* are macOS-only.
 Run it straight from a clone, with no install:
 
 ```sh
-git clone https://github.com/rhys-e/diskcape.git
+git clone https://github.com/rhys-e/diskscape.git
 cd diskscape
 python3 -m diskscape            # start screen: pick a disk or folder
 python3 -m diskscape ~          # scan your home folder straight away
@@ -48,7 +48,7 @@ python3 -m diskscape ~          # scan your home folder straight away
 Or install it as a command with [pipx](https://pipx.pypa.io/):
 
 ```sh
-pipx install git+https://github.com/rhys-e/diskcape.git
+pipx install git+https://github.com/rhys-e/diskscape.git
 diskscape ~/Library
 ```
 
@@ -73,7 +73,7 @@ Options:
 
 ### Stopping
 
-Close the Diskscape window, or press Ctrl+C in the terminal. Either way, Diskscape quits its browser window and deletes the temporary profile. If either step fails, it prints a warning naming what was left behind and exits with status 1.
+Close the Diskscape window, or press Ctrl+C in the terminal. Either way, Diskscape quits its browser window and deletes the temporary profile. Closing the terminal, or stopping Diskscape with `kill`, cleans up the same way. If either step fails, it prints a warning naming what was left behind and exits with status 1.
 
 It also stops itself after 15 minutes without activity, so it doesn't sit in the background forever. Activity means using the window (moving the mouse, scrolling, typing); a window you've left open doesn't count. A running scan never times out, and the timer restarts when the scan finishes.
 

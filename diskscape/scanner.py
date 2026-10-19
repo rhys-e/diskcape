@@ -323,7 +323,10 @@ class Scanner:
         if os.path.realpath(self.root_path) != self.root_path:
             raise ValueError("The scanned folder has moved since the scan")
         parts = os.path.relpath(path, self.root_path).split(os.sep)
-        fd = os.open(self.root_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fd = os.open(self.root_path, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:  # e.g. the drive was ejected, or the folder renamed
+            raise ValueError("The scanned folder is no longer there; rescan first")
         try:
             for part in parts[:-1]:
                 try:
@@ -379,6 +382,8 @@ class Scanner:
         while d is not None:
             d.size += size
             d.count += count
+            if d.parent is not None:  # keep folders largest-first, as tree() relies on
+                d.parent.dirs.sort(key=lambda x: -x.size)  # near-linear: only d moved
             d = d.parent
 
     def _relink(self, gone):

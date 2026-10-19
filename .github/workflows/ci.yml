@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+# Actions are pinned to commit SHAs (tags can be moved); the comment names the release.
 jobs:
   test:
     strategy:
@@ -14,8 +18,10 @@ jobs:
         python: ["3.9", "3.13"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: ${{ matrix.python }}
       - name: Unit tests
@@ -32,3 +38,27 @@ jobs:
         timeout-minutes: 5
         env:
           DISKSCAPE_BROWSER_TESTS: "1"
+
+  # The tests run from the source tree, so they wouldn't notice a wheel that left out the UI.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.13"
+      - uses: SocketDev/action@ba6de6cc0565af1f42295590380973573297e31f  # v1.3.2
+        with:
+          mode: firewall-free
+      - name: Build the wheel (setuptools is fetched through Socket Firewall)
+        run: sfw pip wheel . --no-deps --wheel-dir dist
+      - name: Check the wheel includes the UI
+        shell: python
+        run: |
+          import glob, zipfile
+          names = zipfile.ZipFile(glob.glob("dist/diskscape-*.whl")[0]).namelist()
+          missing = [f for f in ("index.html", "app.js", "style.css") if f"diskscape/static/{f}" not in names]
+          assert not missing, f"the wheel is missing diskscape/static/{missing}"
+          print(f"OK: {len(names)} files, UI included")

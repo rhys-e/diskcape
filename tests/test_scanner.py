@@ -126,6 +126,19 @@ class ScannerTest(unittest.TestCase):
                 self.assertEqual(self.s.root.size, root_before)  # the data still exists once
                 self.assertEqual(d.files[0], f)  # and the folder's files stay sorted
 
+    def test_remove_keeps_folders_sorted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.realpath(tmp)
+            write(f"{root}/a/big.bin", 3_000_000)
+            write(f"{root}/a/small.bin", 100_000)
+            write(f"{root}/b/mid.bin", 1_000_000)
+            s = Scanner(root)
+            s.run()
+            self.assertEqual([d.name for d in s.root.dirs], ["a", "b"])
+            s.remove(f"{root}/a/big.bin")  # "a" is now the smaller folder
+            self.assertEqual([d.name for d in s.root.dirs], ["b", "a"])
+            self.assertEqual([c["name"] for c in s.tree(s.root, 1, 1, 0)["children"]], ["b", "2 smaller items"])
+
     def test_trashing_every_hard_link_frees_the_bytes(self):
         blob = alloc(f"{self.root}/big/blob.bin")
         root_before = self.s.root.size
@@ -188,6 +201,14 @@ class ScannerTest(unittest.TestCase):
         node = Dir("empty", self.s.root)
         self.s._scan_dir(node, path, (st.st_dev, st.st_ino))
         self.assertTrue(node.err)
+
+    def test_check_target_refuses_once_the_scanned_folder_is_gone(self):
+        os.rename(self.root, self.root + "-moved")  # as if the drive was ejected, or the folder renamed
+        try:
+            with self.assertRaisesRegex(ValueError, "no longer there"):
+                self.s.check_target(f"{self.root}/a/b/c/clip.mov")
+        finally:
+            os.rename(self.root + "-moved", self.root)
 
     def test_check_target_for_reveal_allows_symlinks(self):
         st = os.lstat(f"{self.root}/link-to-big")

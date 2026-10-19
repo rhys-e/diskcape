@@ -4,10 +4,13 @@ import json
 import os
 import secrets
 import select
+import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -124,10 +127,11 @@ class App:
         return self.clock() - since
 
     def scan(self, path):
-        if self.scanner:
-            self.scanner.cancel()
-        self.scanner = Scanner(path).start()
-        return self.scanner
+        with self._lock:  # two requests at once mustn't leave an uncancelled scan running
+            if self.scanner:
+                self.scanner.cancel()
+            self.scanner = Scanner(path).start()
+            return self.scanner
 
     def done_scanner(self):
         s = self.scanner
@@ -181,7 +185,8 @@ def make_handler(app):
                 return False
             # Every API call and every POST needs the token; only the static UI is public.
             if path.startswith("/api/") or self.command != "GET":
-                return secrets.compare_digest(self.headers.get("X-Token", ""), app.token)
+                # As bytes: comparing str raises TypeError on non-ASCII header values.
+                return secrets.compare_digest(self.headers.get("X-Token", "").encode(), app.token.encode())
             return True
 
         def _dispatch(self, fn):
@@ -196,6 +201,12 @@ def make_handler(app):
                 result = fn(url)
             except ApiError as e:
                 return self._send(e.code, {"error": str(e)})
+            except (ConnectionError, socket.timeout):
+                raise  # the client went away or stalled; the server drops those quietly
+            except Exception as e:
+                # A bug. Reply with an error: a dropped connection would leave the page guessing.
+                traceback.print_exc()
+                return self._send(500, {"error": f"Unexpected error: {e}"})
             if result is None:
                 return self._send(404, {"error": "Not found"})
             if isinstance(result, tuple):  # (code, raw bytes, content type) for static files
@@ -272,7 +283,7 @@ def make_handler(app):
             if url.path not in POST_ROUTES:
                 return None  # 404 without reading a body nobody needs
             length = self.headers.get("Content-Length") or "0"
-            if not length.isdigit():
+            if not (length.isascii() and length.isdigit()):  # isdigit() alone accepts "²"
                 raise ApiError(400, "Bad Content-Length")
             if int(length) > MAX_BODY:
                 raise ApiError(413, "Request body too large")
@@ -408,6 +419,11 @@ def main(argv=None):
         httpd = make_server(app, args.port)
     except OSError as e:
         sys.exit(str(e))
+
+    # Closing the terminal (SIGHUP) or `kill` (SIGTERM) would otherwise end the process on
+    # the spot, leaving the browser window and its profile behind. Stop the usual way instead.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, frame: app.request_stop("terminated"))
 
     window = None
     if args.no_browser:

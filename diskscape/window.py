@@ -44,6 +44,8 @@ START_PAGE = """<!doctype html>
 
 
 LAUNCH_TIMEOUT = 30.0  # seconds to wait for `open` to hand the window over to the browser
+NO_BROWSER = ("Diskscape opens in its own Chrome, Chromium, Edge or Brave window, "
+              "but none of those browsers is installed.")
 
 
 class LaunchError(RuntimeError):
@@ -62,7 +64,9 @@ class AppWindow:
 
     def __init__(self, url, run=subprocess.run, popen=subprocess.Popen, platform=sys.platform, extra_flags=(),
                  list_processes=None):
-        self.base = tempfile.mkdtemp(prefix="diskscape-")  # mode 0700
+        # On Linux, find the browser first: a snap-packaged one decides where our files must go.
+        linux_browser = None if platform == "darwin" else find_linux_browser()
+        self.base = tempfile.mkdtemp(prefix="diskscape-", dir=temp_parent(linux_browser))  # mode 0700
         self.profile = os.path.join(self.base, "profile")
         self.start_page = os.path.join(self.base, "start.html")
         self.list_processes = list_processes  # injectable for tests; default runs `ps`
@@ -70,7 +74,12 @@ class AppWindow:
             self._write_start_page(url)
             args = [f"--app={pathlib.Path(self.start_page).as_uri()}", f"--user-data-dir={self.profile}",
                     *FLAGS, *extra_flags]
-            self.browser = self._launch(args, run, popen, platform)
+            if linux_browser:
+                popen([linux_browser, *args], stdin=subprocess.DEVNULL,
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.browser = linux_browser
+            else:
+                self.browser = self._open_mac(args, run)
         except BaseException:
             self.close(timeout=2.0)  # a launch that timed out may still have started a browser
             raise
@@ -90,29 +99,20 @@ class AppWindow:
             pass
 
     @staticmethod
-    def _launch(args, run, popen, platform):
-        if platform == "darwin":
-            for bundle_id in MAC_BUNDLE_IDS:
-                # -n: a new instance even if the browser is already open (it is: different profile).
-                try:
-                    r = run(["open", "-n", "-b", bundle_id, "--args", *args],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    raise LaunchError(
-                        f"timed out after {LAUNCH_TIMEOUT:g}s waiting for macOS to open {bundle_id}. This can happen "
-                        "outside a normal desktop login (e.g. over SSH or in CI); there, use --no-browser "
-                        "and open the printed URL yourself.")
-                if r.returncode == 0:
-                    return bundle_id
-        else:
-            for name in LINUX_BINARIES:
-                path = shutil.which(name)
-                if path:
-                    popen([path, *args], stdin=subprocess.DEVNULL,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return path
-        raise NoBrowserError("Diskscape opens in its own Chrome, Chromium, Edge or Brave window, "
-                             "but none of those browsers is installed.")
+    def _open_mac(args, run):
+        for bundle_id in MAC_BUNDLE_IDS:
+            # -n: a new instance even if the browser is already open (it is: different profile).
+            try:
+                r = run(["open", "-n", "-b", bundle_id, "--args", *args],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=LAUNCH_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise LaunchError(
+                    f"timed out after {LAUNCH_TIMEOUT:g}s waiting for macOS to open {bundle_id}. This can happen "
+                    "outside a normal desktop login (e.g. over SSH or in CI); there, use --no-browser "
+                    "and open the printed URL yourself.")
+            if r.returncode == 0:
+                return bundle_id
+        raise NoBrowserError(NO_BROWSER)
 
     def close(self, timeout=5.0, list_processes=None):
         """Quit the browser instance using this profile, then delete the temporary files.
@@ -135,6 +135,28 @@ class AppWindow:
         if error:
             problems.append(f"couldn't delete the temporary browser profile at {self.base} ({error})")
         return problems
+
+
+def find_linux_browser():
+    for name in LINUX_BINARIES:
+        path = shutil.which(name)
+        if path:
+            return path
+    raise NoBrowserError(NO_BROWSER)
+
+
+def temp_parent(browser):
+    """The folder to make our temporary folder in, or None for the system's usual one.
+
+    A snap-packaged browser (Ubuntu's Chromium is one) has a private /tmp and can't read
+    ours, but it can read its own folder in your home: ~/snap/<name>/common.
+    """
+    if not (browser and browser.startswith("/snap/bin/")):
+        return None
+    name = os.path.basename(browser).split(".")[0]  # commands may be "<snap>.<app>"
+    common = os.path.join(os.path.expanduser("~"), "snap", name, "common")
+    os.makedirs(common, exist_ok=True)
+    return common
 
 
 def ps_lines():

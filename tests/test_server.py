@@ -1,8 +1,11 @@
 import http.client
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
@@ -13,6 +16,8 @@ from unittest import mock
 from diskscape import server
 from diskscape.server import (CLOSE_GRACE, CONNECT_TIMEOUT, App, make_server, osascript_path, remove_start_page,
                               stop_when_done)
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 class ServerTest(unittest.TestCase):
@@ -143,6 +148,92 @@ class ServerTest(unittest.TestCase):
         code, body = self.request("POST", "/api/scan", {"path": f"{self.root}/sub/file.txt"})
         self.assertEqual(code, 400)
         self.assertEqual(self.request("POST", "/api/scan", ["not", "an", "object"])[0], 400)
+
+    def test_odd_header_values_get_a_reply(self):
+        host = f"Host: 127.0.0.1:{self.app.port}\r\n".encode()
+        self.assertIn(b"403", self.raw(b"GET /api/status HTTP/1.1\r\n" + host + b"X-Token: \xe9\r\n\r\n"))
+        self.assertIn(b"400", self.raw(b"POST /api/cancel HTTP/1.1\r\n" + host + b"X-Token: test-token\r\n"
+                                       b"Content-Length: \xb2\r\n\r\n"))  # "²" passes str.isdigit()
+
+    def test_unexpected_errors_get_an_error_reply(self):
+        # Not a dropped connection, which the page would take for the server having stopped.
+        with mock.patch.object(server, "volumes", side_effect=RuntimeError("boom")), \
+                mock.patch.object(server.traceback, "print_exc") as print_exc:
+            self.assertEqual(self.request("GET", "/api/volumes"), (500, {"error": "Unexpected error: boom"}))
+        print_exc.assert_called_once()
+
+    def test_actions_once_the_scanned_folder_is_gone(self):
+        if sys.platform != "darwin":
+            self.skipTest("reveal and trash are macOS-only")
+        os.rename(self.root, self.root + "-moved")  # as if the drive was ejected, or the folder renamed
+        try:
+            for action in ("/api/reveal", "/api/trash"):
+                code, body = self.request("POST", action, {"path": f"{self.root}/sub/file.txt"})
+                self.assertEqual(code, 409, action)
+                self.assertIn("no longer there", body["error"])
+        finally:
+            os.rename(self.root + "-moved", self.root)
+
+
+class ScanTest(unittest.TestCase):
+    def test_concurrent_scans_leave_one_running(self):
+        made = []
+
+        class SlowScanner:
+            def __init__(self, path):
+                self.cancelled = False
+                made.append(self)
+
+            def start(self):
+                time.sleep(0.05)  # widens the gap between cancelling the old scan and recording this one
+                return self
+
+            def cancel(self):
+                self.cancelled = True
+
+        app = App()
+        with mock.patch.object(server, "Scanner", SlowScanner):
+            threads = [threading.Thread(target=app.scan, args=("/",)) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertEqual([s for s in made if not s.cancelled], [app.scanner])
+
+
+class SignalTest(unittest.TestCase):
+    """Closing the terminal (SIGHUP) or `kill` (SIGTERM) must still close the window and clean up."""
+
+    CHILD = textwrap.dedent("""
+        import sys
+        from diskscape import server
+
+        class FakeWindow:
+            start_page = ""
+
+            def __init__(self, url):
+                pass
+
+            def close(self):
+                open(sys.argv[1], "w").close()  # proves the cleanup ran
+                return []
+
+        server.AppWindow = FakeWindow
+        server.main(["--port", "0"])
+    """)
+
+    def test_terminate_and_hangup_clean_up(self):
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            with self.subTest(signal=sig.name), tempfile.TemporaryDirectory() as tmp:
+                marker = os.path.join(tmp, "closed")
+                proc = subprocess.Popen([sys.executable, "-c", self.CHILD, marker], cwd=REPO, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                self.addCleanup(proc.stdout.close)
+                self.addCleanup(lambda p=proc: p.poll() is None and p.kill())
+                self.assertIn("open in its own window", proc.stdout.readline())  # up and running
+                proc.send_signal(sig)
+                self.assertEqual(proc.wait(10), 0)
+                self.assertTrue(os.path.exists(marker), "the window was never closed")
 
 
 class TimeoutTest(unittest.TestCase):

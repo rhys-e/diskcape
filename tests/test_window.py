@@ -1,6 +1,7 @@
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -81,6 +82,19 @@ class LaunchTest(unittest.TestCase):
         self.addCleanup(w.close, list_processes=lambda: [])
         self.assertEqual(w.browser, "/usr/bin/chromium")
         self.assertEqual(launched[0][0], "/usr/bin/chromium")
+        self.assertEqual(os.path.dirname(w.base), tempfile.gettempdir())
+
+    def test_linux_snap_browser_gets_files_it_can_read(self):
+        # A snap has a private /tmp, so the start page and profile go in its own folder in your home.
+        launched = []
+        which = {"chromium": "/snap/bin/chromium"}.get
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"HOME": home}), \
+                mock.patch("diskscape.window.shutil.which", side_effect=which):
+            w = AppWindow(URL, popen=lambda cmd, **kw: launched.append(cmd), platform="linux")
+            self.assertEqual(os.path.dirname(w.base), os.path.join(home, "snap", "chromium", "common"))
+            self.assertIn(f"--app={pathlib.Path(w.start_page).as_uri()}", launched[0])
+            self.assertEqual(w.close(list_processes=lambda: []), [])
+            self.assertFalse(os.path.exists(w.base))
 
     def test_no_browser_leaves_nothing_behind(self):
         before = set(os.listdir(tempfile.gettempdir()))
@@ -129,9 +143,13 @@ class CleanupTest(unittest.TestCase):
 
     def test_reports_a_browser_that_will_not_quit(self):
         w = self.window()
-        with mock.patch("diskscape.window.alive", return_value=True):
+        # No real signals: on Linux, PID 999999 could belong to one of your processes.
+        with mock.patch("diskscape.window.alive", return_value=True), \
+                mock.patch("diskscape.window.signal_all") as signal_all:
             problems = w.close(timeout=0.1, list_processes=lambda: [f"999999 chrome --user-data-dir={w.profile}"])
         self.assertIn("browser process 999999 is still running", problems)
+        self.assertEqual([c.args for c in signal_all.call_args_list],
+                         [([999999], signal.SIGTERM), ([999999], signal.SIGKILL)])
 
     def test_reports_a_profile_that_cannot_be_deleted(self):
         w = self.window()

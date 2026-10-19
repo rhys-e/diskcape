@@ -26,18 +26,14 @@ const S = {
 function load(k, d) { try { return localStorage.getItem('ds.' + k) || d; } catch { return d; } }
 function save(k, v) { try { localStorage.setItem('ds.' + k, v); } catch {} }
 
+// A failed request is reported to the caller. Whether the server has actually gone is
+// decided by holdConnection() alone, so one bad request can't fake a shutdown.
 async function api(path, body) {
-  let r;
-  try {
-    r = await fetch(path, {
-      method: body ? 'POST' : 'GET',
-      headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch (e) {
-    showStopped(); // network error: the server has gone away
-    throw e;
-  }
+  const r = await fetch(path, {
+    method: body ? 'POST' : 'GET',
+    headers: { 'X-Token': TOKEN, 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
   return j;
@@ -56,7 +52,8 @@ const pct = (a, b) => (b ? (a / b * 100) : 0);
 const pctStr = (a, b) => { const p = pct(a, b); return (p >= 10 ? p.toFixed(0) : p >= 1 ? p.toFixed(1) : p.toFixed(2)) + '%'; };
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const base = (p) => p === '/' ? S.rootName : p.split('/').filter(Boolean).pop() || p;
-const tilde = (p) => p.startsWith(S.home) ? '~' + p.slice(S.home.length) : p;
+const within = (p, dir) => p === dir || p.startsWith(dir.endsWith('/') ? dir : dir + '/'); // dir, or inside it
+const tilde = (p) => within(p, S.home) ? '~' + p.slice(S.home.length) : p;
 const dark = () => matchMedia('(prefers-color-scheme: dark)').matches;
 const ease = (t) => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
 
@@ -130,11 +127,15 @@ async function startScan(path) {
   }
 }
 
+let scanGen = 0; // bumped by each new scan, so only the latest progress loop keeps running
+
 async function watchScan() {
+  const gen = ++scanGen;
   show('scanView');
   $('#diskMeter').hidden = true;
   for (;;) {
     const st = await api('/api/status');
+    if (gen !== scanGen) return; // a newer scan has its own loop
     $('#pathInput').value = tilde(st.root || '');
     $('#scanBytes').textContent = fmt(st.bytes || 0);
     $('#scanFiles').textContent = num(st.files || 0);
@@ -164,14 +165,14 @@ async function navigate(path, opts = {}) {
   const oldNode = S.byPath.get(path);
   let from = null;
   // Remember where the new focus sits in the current picture, to zoom from it.
-  if (oldNode && oldNode.dir && old && path.startsWith(old + (old.endsWith('/') ? '' : '/'))) {
+  if (oldNode && oldNode.dir && old && path !== old && within(path, old)) {
     const r = S.rects.find((x) => x.n === oldNode);
     from = { dir: 'down', f0: oldNode.f0, f1: oldNode.f1, depth: oldNode.depth, rect: r && { ...r } };
   }
   const tree = await api(`/api/tree?path=${encodeURIComponent(path)}&depth=${MAX_RINGS}&k=150&minfrac=0.0012`);
   S.cur = path;
   setTree(tree);
-  if (!from && old && old.startsWith(path) && old !== path) {
+  if (!from && old && old !== path && within(old, path)) {
     const child = S.byPath.get(old) || ancestorIn(old);
     if (child) {
       const r = S.rects.find((x) => x.n === child);
@@ -189,6 +190,7 @@ async function navigate(path, opts = {}) {
 function ancestorIn(p) {
   while (p && p !== S.cur) {
     if (S.byPath.has(p)) return S.byPath.get(p);
+    if (p === '/') break; // walked past the top without meeting S.cur
     p = p.slice(0, p.lastIndexOf('/')) || '/';
   }
   return null;
@@ -733,7 +735,7 @@ function askTrash(path, name, sizeText) {
       await api('/api/trash', { path });
       dlg.close();
       listCache = {};
-      const target = S.cur === path || S.cur.startsWith(path + '/') ? path.slice(0, path.lastIndexOf('/')) || '/' : S.cur;
+      const target = within(S.cur, path) ? path.slice(0, path.lastIndexOf('/')) || '/' : S.cur;
       navigate(target, { noAnim: true });
     } catch (e) {
       $('#cfErr').textContent = e.message;
