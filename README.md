@@ -81,6 +81,12 @@ It also stops itself after 15 minutes without activity, so it doesn't sit in the
 
 macOS hides some folders (Mail, Messages, Safari, other apps' containers) from apps that lack **Full Disk Access**. Diskscape reports how many items it couldn't read. To include them, grant your terminal app Full Disk Access in **System Settings › Privacy & Security › Full Disk Access**, then rescan.
 
+### Trash permission
+
+*Move to Trash* asks Finder to move the item, which is what makes *Put Back* work. For that, macOS asks whether your terminal app may control Finder. The permission isn't limited to Diskscape: it lets anything you run in that terminal control Finder, so you may prefer not to grant it. You don't need to: use *Reveal in Finder*, which needs no permission, and delete the item in Finder yourself.
+
+If you do want *Move to Trash* in Diskscape, turn on **Finder** under your terminal app in **System Settings › Privacy & Security › Automation**.
+
 ## Security
 
 Diskscape runs a small HTTP server so the browser can talk to the scanner. It is locked down:

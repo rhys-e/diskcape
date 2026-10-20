@@ -162,6 +162,17 @@ class ServerTest(unittest.TestCase):
             self.assertEqual(self.request("GET", "/api/volumes"), (500, {"error": "Unexpected error: boom"}))
         print_exc.assert_called_once()
 
+    def test_trash_without_automation_permission_says_how_to_fix_it(self):
+        if sys.platform != "darwin":
+            self.skipTest("trash is macOS-only")
+        denied = subprocess.CompletedProcess([], 1, "", "99:104: execution error: Not authorised to send "
+                                                        "Apple events to Finder. (-1743)\n")
+        with mock.patch.object(server.subprocess, "run", return_value=denied):
+            code, body = self.request("POST", "/api/trash", {"path": f"{self.root}/sub/file.txt"})
+        self.assertEqual(code, 403)
+        self.assertIn("Reveal in Finder", body["error"])  # the no-permission way, offered first
+        self.assertIn("Privacy & Security › Automation", body["error"])
+
     def test_actions_once_the_scanned_folder_is_gone(self):
         if sys.platform != "darwin":
             self.skipTest("reveal and trash are macOS-only")

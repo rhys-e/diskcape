@@ -33,6 +33,10 @@ TRASH_SCRIPT = """on run argv
     tell application "Finder" to set trashed to delete (POSIX file (item 1 of argv) as alias)
     return POSIX path of (trashed as alias)
 end run"""
+# osascript fails with -1743 (errAEEventNotPermitted) until macOS lets the terminal control Finder.
+TRASH_NOT_ALLOWED = ("macOS hasn't let Diskscape ask Finder to move this to the Trash. Use Reveal in Finder and "
+                     "delete it there instead. (Or turn on Finder under your terminal app in System Settings › "
+                     "Privacy & Security › Automation. That lets anything run in that terminal control Finder.)")
 DEFAULT_IDLE_MINUTES = 15
 CLOSE_GRACE = 3.0  # seconds a window may be disconnected (e.g. reloading) before we stop
 CONNECT_TIMEOUT = 60.0  # seconds for a freshly launched window to connect
@@ -327,6 +331,8 @@ def make_handler(app):
                 return {"ok": True}
             r = subprocess.run(["osascript", "-e", TRASH_SCRIPT, path], capture_output=True, text=True)
             if r.returncode != 0:
+                if "(-1743)" in r.stderr:
+                    raise ApiError(403, TRASH_NOT_ALLOWED)
                 raise ApiError(500, r.stderr.strip() or "Finder could not move the item to the Trash")
             # Finder only takes a path, so the item could still have been swapped after the
             # check. Confirm what landed in the Trash is what we checked.
